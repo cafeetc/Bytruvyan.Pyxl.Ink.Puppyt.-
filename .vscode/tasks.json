@@ -1,0 +1,38 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Dev Server (Port 3000)",
+      "type": "npm",
+      "script": "dev",
+      "isBackground": true,
+      "problemMatcher": [],
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      }
+    },
+    {
+      "label": "Run Unit Tests",
+      "type": "npm",
+      "script": "test",
+      "problemMatcher": [],
+      "group": {
+        "kind": "test",
+        "isDefault": true
+      }
+    },
+    {
+      "label": "Typecheck (tsc --noEmit)",
+      "type": "npm",
+      "script": "lint",
+      "problemMatcher": ["$tsc"]
+    },
+    {
+      "label": "Build Production Bundle",
+      "type": "npm",
+      "script": "build",
+      "problemMatcher": ["$tsc"]
+    }
+  ]
+}

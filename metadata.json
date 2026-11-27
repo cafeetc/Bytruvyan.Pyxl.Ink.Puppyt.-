@@ -1,0 +1,6 @@
+{
+  "name": "Bitruvius Ink Manual & Kinematics Studio",
+  "description": "Anatomical ink puppet and Leonardo proportion manual with refined FK/IK kinematics solvers, multi-joint reach, pose library, and organic ink rendering on parchment.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
