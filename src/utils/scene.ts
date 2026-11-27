@@ -1,6 +1,7 @@
 import {
   ArmatureState,
   JointId,
+  MotionCurve,
   Point2D,
   PosePresetId,
   RigSystemsConfig,
@@ -14,7 +15,12 @@ import {
   WorldPin,
 } from '../types/scene';
 import { ScreenFpsOption } from './frameThrottle';
-import { computeArmature, createPosePreset, solveJointIK } from './kinematics';
+import {
+  computeArmature,
+  createPosePreset,
+  interpolateArmatures,
+  solveJointIK,
+} from './kinematics';
 import {
   PAPER_HEIGHT,
   PAPER_WIDTH,
@@ -209,6 +215,18 @@ export function cloneSceneForNewShot(baseScene: Scene, nextIndex: number): Scene
     ...structuredClone(baseScene),
     id: `scene-${nextIndex + 1}-${Math.random().toString(36).slice(2, 6)}`,
     name: `Shot ${nextIndex + 1}`,
+  };
+}
+
+export function createShotBridgeSlots(
+  previousEndPose: ArmatureState,
+  nextStartPose: ArmatureState,
+  motionCurve: MotionCurve
+): Scene['slots'] {
+  return {
+    A: structuredClone(previousEndPose),
+    B: interpolateArmatures(previousEndPose, nextStartPose, 0.5, motionCurve),
+    C: structuredClone(nextStartPose),
   };
 }
 

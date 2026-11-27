@@ -2,13 +2,13 @@ import React, { useMemo, useState } from 'react';
 import {
   COLLAR_LINK_SCALE,
   REPO_FACE_PURPLE,
-  REPO_GREEN_GLOW_DARK,
   REPO_GREEN_GLOW_LIGHT,
-  REPO_GREEN_JOINT_DARK,
   REPO_GREEN_JOINT_LIGHT,
   REPO_SVG_PURPLE,
+  REPO_STRAIN_CRIMSON,
+  TORSO_HANDLE_CENTER_SVG,
 } from '../data/digitalRig';
-import { ArmatureState, ComputedJoint, JointId } from '../types/rig';
+import { ArmatureState, ComputedJoint, JointId, Point2D } from '../types/rig';
 import { CompositeFilter } from '../types/scene';
 import {
   applyAffine,
@@ -30,7 +30,14 @@ interface DigitalMannequinProps {
   onPointerDownBone: (e: React.PointerEvent<SVGElement>, jointId: JointId) => void;
   onPointerDownHipToggle?: (e: React.PointerEvent<SVGElement>) => void;
   onPointerDownArmSwivel?: (e: React.PointerEvent<SVGGElement>, side: 'R' | 'L') => void;
+  onPointerDownNeckCollarMagnet: (e: React.PointerEvent<SVGGElement>) => void;
+  onResetNeckCollarMagnet: () => void;
+  onPointerDownTorso: (e: React.PointerEvent<SVGGElement>, center: Point2D) => void;
 }
+
+const DARK_MODE_BONE_GREEN = '#34D399';
+const DARK_MODE_FLESH_GREEN = '#6EE7B7';
+const DARK_MODE_HIGHLIGHT_PURPLE = '#D8B4FE';
 
 function toMatrixAttr(m: readonly [number, number, number, number, number, number]): string {
   return `matrix(${m[0].toFixed(5)} ${m[1].toFixed(5)} ${m[2].toFixed(5)} ${m[3].toFixed(5)} ${m[4].toFixed(2)} ${m[5].toFixed(2)})`;
@@ -67,6 +74,9 @@ export const DigitalMannequin: React.FC<DigitalMannequinProps> = React.memo(({
   onPointerDownBone,
   onPointerDownHipToggle,
   onPointerDownArmSwivel,
+  onPointerDownNeckCollarMagnet,
+  onResetNeckCollarMagnet,
+  onPointerDownTorso,
 }) => {
   const [hoveredJointId, setHoveredJointId] = useState<JointId | null>(null);
   const selectedJoint = computedJoints[selectedJointId];
@@ -78,10 +88,10 @@ export const DigitalMannequin: React.FC<DigitalMannequinProps> = React.memo(({
   const haloStdDev = Number((Math.max(0.4, 2.4 - (edgeThreshold / 100) * 1.8)).toFixed(2));
   const coreStdDev = Number((Math.max(0.15, 0.75 - (edgeThreshold / 100) * 0.55)).toFixed(2));
   const alphaSlope = Number((1.0 + (edgeThreshold / 100) * 0.65).toFixed(2));
-  const bodyFill = 'url(#bitruvius-ink-body-grad)';
-  const faceFill = 'url(#bitruvius-face-grad)';
-  const greenJoint = darkMode ? REPO_GREEN_JOINT_DARK : REPO_GREEN_JOINT_LIGHT;
-  const greenGlow = darkMode ? REPO_GREEN_GLOW_DARK : REPO_GREEN_GLOW_LIGHT;
+  const bodyFill = darkMode ? DARK_MODE_BONE_GREEN : 'url(#bitruvius-ink-body-grad)';
+  const faceFill = darkMode ? DARK_MODE_FLESH_GREEN : 'url(#bitruvius-face-grad)';
+  const greenJoint = darkMode ? DARK_MODE_BONE_GREEN : REPO_GREEN_JOINT_LIGHT;
+  const greenGlow = darkMode ? DARK_MODE_HIGHLIGHT_PURPLE : REPO_GREEN_GLOW_LIGHT;
   const hoverAccent = greenGlow;
   const activeAccent = greenGlow;
 
@@ -122,6 +132,15 @@ export const DigitalMannequin: React.FC<DigitalMannequinProps> = React.memo(({
       footL: m('footL', true),
     };
   }, [computedJoints]);
+  const torsoCenter = useMemo(
+    () =>
+      applyAffine(
+        svgMatrices.lumbar,
+        TORSO_HANDLE_CENTER_SVG[0],
+        TORSO_HANDLE_CENTER_SVG[1]
+      ),
+    [svgMatrices.lumbar]
+  );
 
   const hipToggle = useMemo(
     () =>
@@ -261,7 +280,9 @@ export const DigitalMannequin: React.FC<DigitalMannequinProps> = React.memo(({
       data-prometheus-wings="removed"
       style={
         darkMode && !isMotionActive
-          ? { filter: 'drop-shadow(0 0 1.4px rgba(216, 206, 224, 0.5))' }
+          ? {
+              filter: 'drop-shadow(0 0 1.4px rgba(216, 206, 224, 0.5))',
+            }
           : undefined
       }
     >
@@ -292,7 +313,7 @@ export const DigitalMannequin: React.FC<DigitalMannequinProps> = React.memo(({
             y1="0"
             x2="0"
             y2="8"
-            stroke={darkMode ? '#E9D5FF' : '#180222'}
+            stroke={darkMode ? DARK_MODE_HIGHLIGHT_PURPLE : '#180222'}
             strokeWidth="0.65"
             strokeOpacity={darkMode ? 0.09 : 0.14}
           />
@@ -756,7 +777,7 @@ export const DigitalMannequin: React.FC<DigitalMannequinProps> = React.memo(({
         </g>
         <g
           transform={toMatrixAttr(svgMatrices.thumbR)}
-          fill="#4A2259"
+          fill={darkMode ? DARK_MODE_BONE_GREEN : '#4A2259'}
           stroke={segStroke('thumbR')}
           strokeWidth={segStrokeWidth('thumbR')}
           {...bindSegment('thumbR')}
@@ -853,7 +874,7 @@ export const DigitalMannequin: React.FC<DigitalMannequinProps> = React.memo(({
         </g>
         <g
           transform={toMatrixAttr(svgMatrices.thumbL)}
-          fill="#4A2259"
+          fill={darkMode ? DARK_MODE_BONE_GREEN : '#4A2259'}
           stroke={segStroke('thumbL')}
           strokeWidth={segStrokeWidth('thumbL')}
           {...bindSegment('thumbL')}
@@ -934,6 +955,7 @@ export const DigitalMannequin: React.FC<DigitalMannequinProps> = React.memo(({
 
           const collarSnapState = joint.collarSnapState;
           const collarResistanceRatio = joint.collarResistanceRatio;
+          const neckCollarPressureRatio = joint.neckCollarPressureRatio ?? 0;
           const isCollarResisting = collarSnapState === 'resisting';
           const isCollarSnapped = collarSnapState === 'snapped';
 
@@ -943,11 +965,11 @@ export const DigitalMannequin: React.FC<DigitalMannequinProps> = React.memo(({
             ? '#D97706'
             : isCollarSnapped
             ? darkMode
-              ? '#5EEAD4'
+              ? DARK_MODE_HIGHLIGHT_PURPLE
               : '#0D9488'
             : isIK
             ? darkMode
-              ? '#5EEAD4'
+              ? DARK_MODE_HIGHLIGHT_PURPLE
               : '#0D9488'
             : greenGlow;
 
@@ -963,6 +985,7 @@ export const DigitalMannequin: React.FC<DigitalMannequinProps> = React.memo(({
                   ? collarResistanceRatio.toFixed(2)
                   : undefined
               }
+              data-neck-collar-pressure={neckCollarPressureRatio.toFixed(2)}
               transform={`translate(${handle.x}, ${handle.y}) scale(${1 / zoom})`}
               onPointerEnter={() => setHoveredJointId(handle.id)}
               onPointerLeave={() => setHoveredJointId(null)}
@@ -976,6 +999,18 @@ export const DigitalMannequin: React.FC<DigitalMannequinProps> = React.memo(({
               }}
             >
               <circle r={6.5} fill="transparent" />
+              {handle.id === 'neck' && neckCollarPressureRatio > 0 && (
+                <circle
+                  r={5.5 + neckCollarPressureRatio * 2.5}
+                  fill="none"
+                  stroke={REPO_STRAIN_CRIMSON}
+                  strokeOpacity={0.25 + neckCollarPressureRatio * 0.65}
+                  strokeWidth={1 + neckCollarPressureRatio}
+                  style={{
+                    filter: `drop-shadow(0 0 ${1 + neckCollarPressureRatio * 3}px ${REPO_STRAIN_CRIMSON})`,
+                  }}
+                />
+              )}
               {/* Subtle translucent verdigris halo on IK/selected/hovered/collar-snap joints */}
               {(isSelected ||
                 isHovered ||
@@ -1017,11 +1052,13 @@ export const DigitalMannequin: React.FC<DigitalMannequinProps> = React.memo(({
               <circle
                 r={isSelected ? 2.4 : 2.05}
                 fill={
-                  isExplicitPin
+                  handle.id === 'neck' && neckCollarPressureRatio > 0
+                    ? REPO_STRAIN_CRIMSON
+                    : isExplicitPin
                     ? '#F59E0B'
                     : isCollarSnapped
                     ? darkMode
-                      ? '#5EEAD4'
+                      ? DARK_MODE_HIGHLIGHT_PURPLE
                       : '#0D9488'
                     : isCollarResisting
                     ? '#F59E0B'
@@ -1034,6 +1071,56 @@ export const DigitalMannequin: React.FC<DigitalMannequinProps> = React.memo(({
             </g>
           );
         })}
+
+        {(() => {
+          const thorax = computedJoints.thorax;
+          const neck = computedJoints.neck;
+          const pressure = neck.neckCollarPressureRatio ?? 0;
+          const x = (thorax.x + neck.x) / 2;
+          const y = (thorax.y + neck.y) / 2;
+          return (
+            <g
+              data-neck-collar-magnet="true"
+              data-neck-collar-pressure={pressure.toFixed(2)}
+              transform={`translate(${x}, ${y}) scale(${1 / zoom})`}
+              onPointerDown={onPointerDownNeckCollarMagnet}
+              onDoubleClick={(event) => {
+                event.stopPropagation();
+                onResetNeckCollarMagnet();
+              }}
+              style={{ cursor: isPanning ? 'grabbing' : 'move' }}
+            >
+              <title>Drag to separate the neck and collar group; double-click to reconnect</title>
+              <circle r={8} fill="transparent" />
+              {pressure > 0.01 && (
+                <circle
+                  r={5.6 + pressure * 2.2}
+                  fill="none"
+                  stroke={REPO_STRAIN_CRIMSON}
+                  strokeOpacity={0.28 + pressure * 0.62}
+                  strokeWidth={1 + pressure}
+                  style={{
+                    filter: `drop-shadow(0 0 ${1 + pressure * 3}px ${REPO_STRAIN_CRIMSON})`,
+                  }}
+                />
+              )}
+              <circle
+                r={3.5}
+                fill="none"
+                stroke={pressure > 0.01 ? REPO_STRAIN_CRIMSON : greenGlow}
+                strokeOpacity={pressure > 0.01 ? 0.92 : 0.38}
+                strokeWidth={1.15}
+              />
+              <path
+                d="M-1.6,-1.7 V1.7 M1.6,-1.7 V1.7"
+                fill="none"
+                stroke={pressure > 0.01 ? REPO_STRAIN_CRIMSON : greenJoint}
+                strokeWidth={1.15}
+                strokeLinecap="round"
+              />
+            </g>
+          );
+        })()}
 
         {/* Interactive Center Toggle Hinge ("knee") for the 2-bone hip bridge */}
         <g
@@ -1063,7 +1150,7 @@ export const DigitalMannequin: React.FC<DigitalMannequinProps> = React.memo(({
           const isReversed = sw.reverseFactor < 0;
           const accent = isReversed
             ? darkMode
-              ? '#5EEAD4'
+              ? DARK_MODE_HIGHLIGHT_PURPLE
               : '#0D9488'
             : greenGlow;
           return (
@@ -1093,6 +1180,25 @@ export const DigitalMannequin: React.FC<DigitalMannequinProps> = React.memo(({
             </g>
           );
         })}
+        <g
+          data-torso-ik-handle="true"
+          transform={`translate(${torsoCenter.x}, ${torsoCenter.y}) scale(${1 / zoom})`}
+          onPointerEnter={() => setHoveredJointId('lumbar')}
+          onPointerLeave={() => setHoveredJointId(null)}
+          onPointerDown={(e) => onPointerDownTorso(e, torsoCenter)}
+          style={{ cursor: isPanning ? 'grabbing' : 'move' }}
+        >
+          <title>Drag to balance the torso with the whole figure</title>
+          <circle r={8} fill="transparent" />
+          <circle
+            r={4.5}
+            fill="none"
+            stroke={activeAccent}
+            strokeOpacity={selectedJointId === 'lumbar' ? 0.9 : 0.58}
+            strokeWidth={selectedJointId === 'lumbar' ? 1.35 : 1}
+          />
+          <circle r={1.7} fill={greenJoint} fillOpacity={0.78} />
+        </g>
       </g>
     </g>
   );

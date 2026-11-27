@@ -43,7 +43,7 @@ export const ScanBorderLayer: React.FC<ScanBorderLayerProps> = React.memo(({
   const outerRimH = e * 0.22;
   const boardStepH = e * 0.29;
   const mountBevelH = e * 0.37;
-  const sideSpanH = Math.max(0, layout.vh - outerRimH * 2);
+  const sideSpanH = layout.vh;
   const leftSlice = layout.slices.find((s) => s.id === 'edge-left');
   const rightSlice = layout.slices.find((s) => s.id === 'edge-right');
 
@@ -105,19 +105,19 @@ export const ScanBorderLayer: React.FC<ScanBorderLayerProps> = React.memo(({
         </defs>
 
         <g opacity={borderOpacity * rimAlpha} filter={`url(#${filterId})`}>
-          {/* Straight vertical left & right cover-board edges clipped cleanly between flat top/bottom rails */}
+          {/* Side edges extend under the flattened rails so their ends stay cleanly covered. */}
           {[leftSlice, rightSlice].map((slice) => {
             if (!slice || sideSpanH <= 0) return null;
             const scaleX = slice.flipX ? -1 : 1;
-            const srcVerticalClip = `0 160 ${SRC_EDGE} ${PAPER_HEIGHT - 320}`;
+            const srcVerticalClip = `0 0 ${SRC_EDGE} ${PAPER_HEIGHT}`;
             const cx = SRC_EDGE / 2;
-            const cy = 160 + (PAPER_HEIGHT - 320) / 2;
+            const cy = PAPER_HEIGHT / 2;
 
             return (
               <svg
                 key={slice.id}
                 x={slice.x}
-                y={outerRimH}
+                y={0}
                 width={slice.w}
                 height={sideSpanH}
                 viewBox={srcVerticalClip}

@@ -212,6 +212,7 @@ export const ModularWorkspaceOverlay: React.FC<ModularWorkspaceOverlayProps> = R
   const overlayRef = useRef<HTMLDivElement | null>(null);
   const [handSide, setHandSide] = useState<'right' | 'left' | 'both'>('both');
   const [dragState, setDragState] = useState<ActivePanelDrag | null>(null);
+  const [moduleSpawnNotice, setModuleSpawnNotice] = useState('');
   const dragRef = useRef<ActivePanelDrag | null>(null);
 
   const selectedSpec = JOINT_SPEC_MAP[selectedJointId];
@@ -282,6 +283,104 @@ export const ModularWorkspaceOverlay: React.FC<ModularWorkspaceOverlayProps> = R
     [railVisible]
   );
 
+  const findSafeModulePosition = useCallback(
+    (moduleId: ModelModuleId) => {
+      const overlay = overlayRef.current;
+      const model = overlay?.parentElement?.querySelector<SVGGraphicsElement>(
+        '[data-digital-bones="true"]'
+      );
+      if (!overlay || !model) return null;
+
+      const stageRect = overlay.getBoundingClientRect();
+      const modelRect = model.getBoundingClientRect();
+      if (modelRect.width <= 0 || modelRect.height <= 0) return null;
+
+      const modelBounds = {
+        left: modelRect.left - stageRect.left,
+        top: modelRect.top - stageRect.top,
+        right: modelRect.right - stageRect.left,
+        bottom: modelRect.bottom - stageRect.top,
+      };
+      const panelHeight = panels[moduleId].isCollapsed ? 40 : 400;
+      const maxX =
+        stageRect.width -
+        EDGE_MARGIN -
+        (railVisible ? RAIL_RESERVE_PX : 0) -
+        PANEL_WIDTH;
+      const maxY = stageRect.height - panelHeight - EDGE_MARGIN;
+      if (maxX < EDGE_MARGIN || maxY < EDGE_MARGIN) return null;
+
+      const clampX = (x: number) => Math.max(EDGE_MARGIN, Math.min(maxX, x));
+      const clampY = (y: number) => Math.max(EDGE_MARGIN, Math.min(maxY, y));
+      const modelCenterX = (modelBounds.left + modelBounds.right) / 2;
+      const modelCenterY = (modelBounds.top + modelBounds.bottom) / 2;
+      const candidates = [
+        { x: modelBounds.left - PANEL_WIDTH - EDGE_MARGIN, y: modelCenterY - panelHeight / 2 },
+        { x: modelBounds.right + EDGE_MARGIN, y: modelCenterY - panelHeight / 2 },
+        { x: modelCenterX - PANEL_WIDTH / 2, y: modelBounds.top - panelHeight - EDGE_MARGIN },
+        { x: modelCenterX - PANEL_WIDTH / 2, y: modelBounds.bottom + EDGE_MARGIN },
+        { x: EDGE_MARGIN, y: EDGE_MARGIN },
+        { x: maxX, y: EDGE_MARGIN },
+        { x: EDGE_MARGIN, y: maxY },
+        { x: maxX, y: maxY },
+      ].map(({ x, y }) => ({ x: clampX(x), y: clampY(y) }));
+
+      const gap = EDGE_MARGIN;
+      const position = candidates.find(({ x, y }) => {
+        const overlapsModel =
+          x < modelBounds.right + gap &&
+          x + PANEL_WIDTH > modelBounds.left - gap &&
+          y < modelBounds.bottom + gap &&
+          y + panelHeight > modelBounds.top - gap;
+        return !overlapsModel;
+      });
+      return position ?? null;
+    },
+    [panels, railVisible]
+  );
+
+  const handleModuleLauncherClick = useCallback(
+    (moduleId: ModelModuleId) => {
+      setModuleSpawnNotice('');
+      if (panels[moduleId].isOpen) {
+        onToggleModule(moduleId);
+        return;
+      }
+
+      const position = findSafeModulePosition(moduleId);
+      if (!position) {
+        setModuleSpawnNotice(
+          'No clear space beside the figure. Resize the stage or close another panel.'
+        );
+        return;
+      }
+
+      onSetModuleDockMode(moduleId, 'floating', position);
+      onToggleModule(moduleId);
+    },
+    [findSafeModulePosition, onSetModuleDockMode, onToggleModule, panels]
+  );
+
+  const handleModuleDockToggle = useCallback(
+    (moduleId: ModelModuleId, isFloating: boolean) => {
+      setModuleSpawnNotice('');
+      if (isFloating) {
+        onSetModuleDockMode(moduleId, 'docked');
+        return;
+      }
+
+      const position = findSafeModulePosition(moduleId);
+      if (position) {
+        onSetModuleDockMode(moduleId, 'floating', position);
+      } else {
+        setModuleSpawnNotice(
+          'No clear space beside the figure. Resize the stage or close another panel.'
+        );
+      }
+    },
+    [findSafeModulePosition, onSetModuleDockMode]
+  );
+
   const handleStartPanelDrag = useCallback(
     (
       e: React.PointerEvent<HTMLDivElement>,
@@ -321,7 +420,7 @@ export const ModularWorkspaceOverlay: React.FC<ModularWorkspaceOverlayProps> = R
       dragRef.current = nextDrag;
       setDragState(nextDrag);
     },
-    [onBringModuleToFront, onSetModuleDockMode, panels]
+    [onBringModuleToFront, onSetModuleDockMode, panels, findSafeModulePosition]
   );
 
   const isDraggingPanel = dragState !== null;
@@ -1170,13 +1269,7 @@ export const ModularWorkspaceOverlay: React.FC<ModularWorkspaceOverlayProps> = R
           >
             <button
               type="button"
-              onClick={() =>
-                onSetModuleDockMode(
-                  moduleMeta.id,
-                  isFloating ? 'docked' : 'floating',
-                  isFloating ? undefined : { x: 24, y: 24 }
-                )
-              }
+              onClick={() => handleModuleDockToggle(moduleMeta.id, isFloating)}
               aria-label={isFloating ? `Attach ${moduleMeta.label} to right dock` : `Float ${moduleMeta.label}`}
               title={isFloating ? 'Attach to right dock' : 'Detach to float'}
               className="p-1 rounded-[2px] text-[#B8A9C9] hover:text-[#6EE7B7] hover:bg-[#2C143B] cursor-pointer"
@@ -1256,7 +1349,7 @@ export const ModularWorkspaceOverlay: React.FC<ModularWorkspaceOverlayProps> = R
           {/* Slim Right Vertical Icon Menu (Quick Toggles + Module Launchers) */}
           <nav
             aria-label="Model quick toggles & modules"
-            className="pointer-events-auto w-11 max-h-full overflow-y-auto shrink-0 bg-[#16001E]/88 backdrop-blur-md border border-[#EBE0F5]/16 rounded-[4px] p-1 flex flex-col items-center gap-0.5 shadow-xl"
+            className="pointer-events-auto relative w-11 max-h-full overflow-y-auto shrink-0 bg-[#16001E]/88 backdrop-blur-md border border-[#EBE0F5]/16 rounded-[4px] p-1 flex flex-col items-center gap-0.5 shadow-xl"
           >
             {/* Quick Model Toggles */}
             <button
@@ -1385,7 +1478,7 @@ export const ModularWorkspaceOverlay: React.FC<ModularWorkspaceOverlayProps> = R
                   aria-pressed={active}
                   aria-label={meta.label}
                   title={meta.label}
-                  onClick={() => onToggleModule(meta.id)}
+                  onClick={() => handleModuleLauncherClick(meta.id)}
                   className={`w-full min-h-[36px] rounded-[3px] border flex items-center justify-center cursor-pointer transition-colors shrink-0 ${
                     active
                       ? 'bg-[#240B31] border-[#34D399]/70 text-[#6EE7B7]'
@@ -1396,6 +1489,15 @@ export const ModularWorkspaceOverlay: React.FC<ModularWorkspaceOverlayProps> = R
                 </button>
               );
             })}
+
+            {moduleSpawnNotice && (
+              <span
+                role="status"
+                className="absolute right-full top-1/2 mr-2 w-52 -translate-y-1/2 rounded-[3px] border border-[#EBE0F5]/20 bg-[#16001E]/95 px-2 py-1.5 text-left text-[10px] leading-snug text-[#E6DCF0] shadow-xl"
+              >
+                {moduleSpawnNotice}
+              </span>
+            )}
 
             <span className="w-6 h-px bg-[#EBE0F5]/16 my-0.5 shrink-0" aria-hidden="true" />
 

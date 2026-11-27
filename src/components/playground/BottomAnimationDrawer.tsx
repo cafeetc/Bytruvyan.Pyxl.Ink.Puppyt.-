@@ -66,7 +66,7 @@ export interface BottomAnimationDrawerProps {
   playbackMode: ScenePlaybackMode;
   screenFps: ScreenFpsOption;
   onCycleFps: () => void;
-  onSelectScene: (sceneId: string) => void;
+  onSelectScene: (sceneId: string, clickCount?: number) => void;
   onAddScene: () => void;
   onDuplicateScene: (sceneId: string) => void;
   onDeleteScene: (sceneId: string) => void;
@@ -541,11 +541,18 @@ export const BottomAnimationDrawer: React.FC<BottomAnimationDrawerProps> = React
                 <div className="flex flex-wrap gap-1">
                   {scenes.map((scene, idx) => {
                     const isActive = scene.id === activeScene.id;
+                    const gestureHint =
+                      idx === 0
+                        ? 'Double-click has no previous shot to copy. Triple-click sets keyframe A to T-pose.'
+                        : idx < scenes.length - 1
+                          ? 'Double-click to bridge the previous shot end to the next shot start. Triple-click sets keyframe A to T-pose.'
+                          : 'Double-click to copy the previous shot end into keyframe A. Triple-click sets keyframe A to T-pose.';
                     return (
                       <button
                         key={scene.id}
                         type="button"
-                        onClick={() => onSelectScene(scene.id)}
+                        onClick={(event) => onSelectScene(scene.id, event.detail)}
+                        title={`Click to select. ${gestureHint}`}
                         aria-current={isActive ? 'true' : undefined}
                         className={`px-2 py-1 rounded-[2px] border flex items-center gap-1 cursor-pointer whitespace-nowrap ${
                           isActive

@@ -13,8 +13,10 @@ export const REPO_GREEN_JOINT_DARK = '#58C76E';
 export const REPO_GREEN_GLOW_LIGHT = '#6D7A71';
 export const REPO_GREEN_GLOW_DARK = '#8C9990';
 export const REPO_SECONDARY_PURPLE = '#261D2E';
-export const REPO_STRAIN_CRIMSON = '#E11D48';
+export const REPO_STRAIN_CRIMSON = '#F04438';
 
+export const FACEPLATE_SLIDE_LIMIT_SVG = 30;
+export const TORSO_HANDLE_CENTER_SVG = [824, 810] as const;
 export const COLLAR_LINK_SCALE = 1.12;
 
 export const SVG_MODEL_CONSTANTS = {
@@ -783,8 +785,8 @@ const RAW_43_JOINT_SPECS: JointSpec[] = [
   // Right Leg & Foot (5)
   {
     id: 'hipR',
-    label: 'Right Hip Swivel',
-    shortCode: 'R.HIP',
+    label: 'Right Loin Pivot',
+    shortCode: 'R.LOIN',
     subtitle: 'Right pelvic half swivel',
     parentId: 'pelvis',
     role: 'limb_leg',
@@ -794,7 +796,7 @@ const RAW_43_JOINT_SPECS: JointSpec[] = [
     lengthPx: vecLenScaled(PUPPYT_LANDMARKS.pelvis, PUPPYT_LANDMARKS.femurR),
     endExtensionPx: vecLenScaled(PUPPYT_LANDMARKS.pelvis, PUPPYT_LANDMARKS.femurR),
     bodyPartCategory: 'pelvis',
-    limits: [-10, 21],
+    limits: [-11.5, 22.5],
     defaultLocalAngle: 0,
     defaultMode: 'FK',
   },
@@ -876,8 +878,8 @@ const RAW_43_JOINT_SPECS: JointSpec[] = [
   // Left Leg & Foot (5)
   {
     id: 'hipL',
-    label: 'Left Hip Swivel',
-    shortCode: 'L.HIP',
+    label: 'Left Loin Pivot',
+    shortCode: 'L.LOIN',
     subtitle: 'Left pelvic half swivel',
     parentId: 'pelvis',
     role: 'limb_leg',
@@ -887,7 +889,7 @@ const RAW_43_JOINT_SPECS: JointSpec[] = [
     lengthPx: vecLenScaled(PUPPYT_LANDMARKS.pelvis, PUPPYT_LANDMARKS.femurL),
     endExtensionPx: vecLenScaled(PUPPYT_LANDMARKS.pelvis, PUPPYT_LANDMARKS.femurL),
     bodyPartCategory: 'pelvis',
-    limits: [-21, 10],
+    limits: [-22.5, 11.5],
     defaultLocalAngle: 0,
     defaultMode: 'FK',
   },
