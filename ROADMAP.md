@@ -60,6 +60,27 @@ Playground remains the context intake and prototype area. Contexts are promoted 
 
 The existing V1.5–V1.7 items below remain long-term backlog and follow this shared-mask foundation unless reprioritized.
 
+## Context Promotion Priority System
+
+Score each upstream context against this app before adapting it:
+
+- **Relevance (0–5):** how directly it supports the current studio and the shared-rig simple/advanced mask goal.
+- **Gap (0–2):** `0` duplicates a working app feature, `1` extends one, `2` fills a real capability gap.
+- **Compatibility gate:** `Pass` means it uses current state/rules as-is; `Adapt` means a bounded mapping is needed; `Hold` means it forks the rig, changes constraints, or depends on unresolved rules. `Hold` cannot be promoted regardless of score.
+- **Priority score = Relevance + Gap** (maximum 7). P1 = 6–7, P2 = 4–5, P3 = 1–3. Duplicate or incompatible work stays out of the implementation queue. Estimate effort separately; use it only to order items within a priority.
+
+| Context from upstream | Relevance + gap | Gate | Priority and disposition |
+| --- | ---: | --- | --- |
+| Evolved 43-joint skeletal artwork as a mask over the existing armature | 5 + 2 = 7 | Adapt | **P1.** Core goal. Map geometry to existing joints/transforms; do not port its solver or create a second pose state. |
+| Geometry attachment/seam validation | 5 + 2 = 7 | Pass | **P1.** Add focused attachment and continuity checks alongside the mask adapter. |
+| Simple/advanced inspection presentation (shadow, purple, hybrid, wireframe) | 4 + 2 = 6 | Adapt | **P2.** Useful for comparing skins and validating the switch; add only after the advanced renderer exists. |
+| Procedural per-part masks, visibility, and proportions | 4 + 2 = 6 | Adapt | **P2.** Consider as render configuration only. Do not import global scale controls that alter canonical bone lengths or pose rules. |
+| Scene-planner command grammar and ZIP vector-sequence import | 2 + 2 = 4 | Pass | **P3.** Adjacent workflow ideas; current scenes, keyframes, and exports take precedence. |
+| Extra PNG/Lottie export formats | 2 + 1 = 3 | Pass | **P3.** Existing versioned Export IR already covers JSON, SVG, Spine, and DragonBones; add formats only against a demonstrated workflow need. |
+| Older 18-joint FK/FABRIK engine and its pose/tween library | 1 + 0 = 1 | Hold | **Do not port.** The topology and overlapping pose/tween behavior conflict with or duplicate the current 43-joint system. |
+
+Promote one bounded capability at a time: document its mapping, implement behind the existing state/solver boundary, add a focused regression check, validate in the app, then record the outcome before taking the next P1/P2 item. Re-score when the app or user goal changes; do not bulk-merge upstream repositories.
+
 ## Deferred Upcoming Phases
 
 ### V1.5 — Binary & Streaming Export Formats
