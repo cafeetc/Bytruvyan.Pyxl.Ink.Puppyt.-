@@ -1,7 +1,14 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { JOINT_SPEC_MAP, REPO_DARKEST_PURPLE } from '../data/digitalRig';
+import { JOINT_SPEC_MAP, REPO_DARKEST_PURPLE, REPO_STRAIN_CRIMSON } from '../data/digitalRig';
 import { GridConfig, PageId, TurnDirection } from '../types/canvas';
-import { ArmatureState, ComputedJoint, JointId, Point2D, RigSystemsConfig } from '../types/rig';
+import {
+  ArmatureState,
+  ComputedJoint,
+  GroundContactPin,
+  JointId,
+  Point2D,
+  RigSystemsConfig,
+} from '../types/rig';
 import {
   CompositeFilter,
   SceneMedia,
@@ -12,16 +19,22 @@ import {
   applyCollarSwivelDragInput,
   applyJointAngleConstraint,
   DEFAULT_TOGGLE_TRANSITION_MS,
+  FaceplateLookCollarHold,
   getPhysicsMultiplier,
   HIP_BRIDGE_LINK_STAGE_PX,
   normalizeAngleDeg,
   setArmReverseSwivel,
+  setJointMode,
   shortestAngleDelta,
   solveCollarToggleFromTarget,
   solveHipToggleFromTarget,
   solveJointIK,
+  solveFaceplateLookIK,
+  solvePressurePlateContact,
   solveToggleHinge2Link,
+  solveTorsoBalance,
   solveWaistBalanceHula,
+  setNeckCollarSeparation,
   toggleArmReverseSwivel,
 } from '../utils/kinematics';
 import {
@@ -31,6 +44,7 @@ import {
   buildStageSvgTransform,
   computeMediaPlateBox,
   createDefaultSceneMedia,
+  mediaToWorld,
   resolveVideoTimeForTimeline,
   worldToMedia,
 } from '../utils/scene';
@@ -43,6 +57,7 @@ import {
   SUBPYXL_PX,
   computeProportionalCanons,
   computeSymmetricalBorderLayout,
+  computeSymmetricalFitZoom,
   computeSymmetricalRulerTicks,
   getPageMetadata,
 } from '../utils/proportions';
@@ -80,6 +95,7 @@ interface BookStageCanvasProps {
   isPlaying?: boolean;
   onCommitPoseHistory: () => void;
   rigSystems?: RigSystemsConfig;
+  onUpdateRigSystems?: (patch: Partial<RigSystemsConfig>) => void;
   showPerspective?: boolean;
   vanishingPoint?: { x: number; y: number };
   onVanishingPointChange?: (vp: { x: number; y: number }) => void;
@@ -101,10 +117,65 @@ const INK_STRENGTH_OPACITY = {
 } as const;
 
 const EIGHT_HEAD_INDICES = [0, 1, 2, 3, 4, 5, 6, 7, 8] as const;
+const MAX_ZOOM = 2.4;
 const PERSPECTIVE_RAY_VECTORS = Array.from({ length: 16 }, (_, idx) => {
   const angle = (idx / 16) * Math.PI * 2;
   return { idx, dx: Math.cos(angle) * 2800, dy: Math.sin(angle) * 2800 };
 });
+
+function getFigureBounds(
+  joints: Record<JointId, ComputedJoint>,
+  transform: StageTransform,
+  origin: Point2D
+) {
+  const bounds = {
+    minX: Number.POSITIVE_INFINITY,
+    minY: Number.POSITIVE_INFINITY,
+    maxX: Number.NEGATIVE_INFINITY,
+    maxY: Number.NEGATIVE_INFINITY,
+  };
+  for (const joint of Object.values(joints)) {
+    for (const point of [
+      { x: joint.x, y: joint.y },
+      { x: joint.endX, y: joint.endY },
+    ]) {
+      const screenWorldPoint = mediaToWorld(point, transform, origin);
+      bounds.minX = Math.min(bounds.minX, screenWorldPoint.x);
+      bounds.minY = Math.min(bounds.minY, screenWorldPoint.y);
+      bounds.maxX = Math.max(bounds.maxX, screenWorldPoint.x);
+      bounds.maxY = Math.max(bounds.maxY, screenWorldPoint.y);
+    }
+  }
+  return bounds;
+}
+
+const GROUND_CONTACT_TOLERANCE_PX = 12;
+
+function getGroundContactPin(
+  ankle: ComputedJoint,
+  toe: ComputedJoint,
+  groundY: number,
+  side: 'R' | 'L'
+): GroundContactPin {
+  const ankleDistance = Math.abs(groundY - ankle.y);
+  const toeDistance = Math.abs(groundY - toe.y);
+  const ankleIsCloser = ankleDistance <= toeDistance;
+  const contactDistance = Math.min(ankleDistance, toeDistance);
+  const supportWeight = Math.max(
+    0,
+    Math.min(1, 1 - contactDistance / GROUND_CONTACT_TOLERANCE_PX)
+  );
+  const useAnkle = ankleIsCloser || supportWeight <= 0;
+  const contact = useAnkle ? ankle : toe;
+
+  return {
+    x: contact.x,
+    y: contact.y,
+    jointId: useAnkle ? (side === 'R' ? 'footR' : 'footL') : side === 'R' ? 'toeR' : 'toeL',
+    supportWeight,
+    worldAngle: useAnkle ? ankle.worldAngle : undefined,
+  };
+}
 
 type ActiveDragState =
   | {
@@ -126,12 +197,36 @@ type ActiveDragState =
       offsetY: number;
     }
   | {
+      type: 'faceplate_look';
+      startArmature: ArmatureState;
+      offsetX: number;
+      offsetY: number;
+      collarHold?: FaceplateLookCollarHold;
+    }
+  | {
+      type: 'pressure_plate';
+      startArmature: ArmatureState;
+      offsetY: number;
+    }
+  | {
+      type: 'neck_collar_magnet';
+      startPointer: Point2D;
+      startSeparation: Point2D;
+    }
+  | {
       type: 'fk_rotate';
       targetJointId: JointId;
       pivotX: number;
       pivotY: number;
       lastCursorDeg: number | null;
       rawAngle: number;
+      startPelvis?: Point2D;
+      startRootRotation?: number;
+      startLumbarAngle?: number;
+      startThoraxAngle?: number;
+      startNeckAngle?: number;
+      footRPin?: GroundContactPin;
+      footLPin?: GroundContactPin;
     }
   | {
       type: 'vanishing_point';
@@ -154,8 +249,22 @@ type ActiveDragState =
       startPelvis: Point2D;
       startRootRotation: number;
       startLumbarAngle: number;
-      footRPin: Point2D & { worldAngle: number };
-      footLPin: Point2D & { worldAngle: number };
+      startThoraxAngle: number;
+      startNeckAngle: number;
+      footRPin: GroundContactPin;
+      footLPin: GroundContactPin;
+      offsetX: number;
+      offsetY: number;
+    }
+  | {
+      type: 'torso_balance';
+      startPelvis: Point2D;
+      startRootRotation: number;
+      startLumbarAngle: number;
+      startThoraxAngle: number;
+      startNeckAngle: number;
+      footRPin: GroundContactPin;
+      footLPin: GroundContactPin;
       offsetX: number;
       offsetY: number;
     }
@@ -204,6 +313,7 @@ export const BookStageCanvas: React.FC<BookStageCanvasProps> = React.memo(({
   isPlaying = false,
   onCommitPoseHistory,
   rigSystems,
+  onUpdateRigSystems,
   showPerspective = false,
   vanishingPoint,
   onVanishingPointChange,
@@ -223,6 +333,7 @@ export const BookStageCanvas: React.FC<BookStageCanvasProps> = React.memo(({
   const [viewportSize, setViewportSize] = useState({ width: 1440, height: 820 });
   const [dragState, setDragState] = useState<ActiveDragState | null>(null);
   const dragRef = useRef<ActiveDragState | null>(null);
+  const [isGroundLineHovered, setIsGroundLineHovered] = useState(false);
 
   const effectiveMedia = useMemo(
     () => sceneMedia ?? createDefaultSceneMedia(),
@@ -244,6 +355,7 @@ export const BookStageCanvas: React.FC<BookStageCanvasProps> = React.memo(({
   const screenFpsRef = useRef<ScreenFpsOption>(screenFps);
   screenFpsRef.current = screenFps;
   const lastRightClickRef = useRef<{ time: number; x: number; y: number } | null>(null);
+  const rightClickTimerRef = useRef<number | null>(null);
   const lastLeftClickRef = useRef<{ time: number; x: number; y: number; count: number } | null>(null);
   const leftClickTimerRef = useRef<number | null>(null);
   const pointerDownPosRef = useRef<{ x: number; y: number } | null>(null);
@@ -258,6 +370,8 @@ export const BookStageCanvas: React.FC<BookStageCanvasProps> = React.memo(({
   }>({});
   const lastScreenEmitMsRef = useRef<number>(-1);
   const screenTimerRef = useRef<number | null>(null);
+  const pendingPointerMoveRef = useRef<{ clientX: number; clientY: number } | null>(null);
+  const pointerMoveFrameRef = useRef<number | null>(null);
 
   const [turnAnim, setTurnAnim] = useState<{
     key: number;
@@ -363,6 +477,11 @@ export const BookStageCanvas: React.FC<BookStageCanvasProps> = React.memo(({
         window.clearTimeout(leftClickTimerRef.current);
         leftClickTimerRef.current = null;
       }
+      if (pointerMoveFrameRef.current !== null) {
+        window.cancelAnimationFrame(pointerMoveFrameRef.current);
+        pointerMoveFrameRef.current = null;
+      }
+      pendingPointerMoveRef.current = null;
     };
   }, []);
 
@@ -412,6 +531,10 @@ export const BookStageCanvas: React.FC<BookStageCanvasProps> = React.memo(({
 
   const canons = useMemo(() => computeProportionalCanons(), []);
   const originOffset = useMemo(() => ({ x: PAPER_WIDTH / 2, y: PAPER_HEIGHT / 2 }), []);
+  const figureBounds = useMemo(
+    () => getFigureBounds(computedJoints, effectiveTransform, originOffset),
+    [computedJoints, effectiveTransform, originOffset]
+  );
   const mediaPlateBox = useMemo(
     () => computeMediaPlateBox(effectiveMedia, originOffset),
     [effectiveMedia, originOffset]
@@ -526,28 +649,58 @@ export const BookStageCanvas: React.FC<BookStageCanvasProps> = React.memo(({
   );
 
   const handleWheel = useCallback(
-    (e: React.WheelEvent<SVGSVGElement>) => {
+    (e: WheelEvent) => {
       e.preventDefault();
       const rect = svgRef.current?.getBoundingClientRect();
       if (!rect) return;
-      const sx = e.clientX - rect.left;
-      const sy = e.clientY - rect.top;
       const factor = e.deltaY < 0 ? 1.1 : 0.91;
       const curZoom = zoomRef.current;
       const curPan = panRef.current;
-      const nextZoom = Math.max(0.1, Math.min(2.4, curZoom * factor));
-      const worldX = (sx - curPan.x) / curZoom;
-      const worldY = (sy - curPan.y) / curZoom;
+      const bypassResistance = e.metaKey && e.shiftKey;
+      const minZoom = bypassResistance
+        ? 0.1
+        : computeSymmetricalFitZoom(viewportSize.width, viewportSize.height);
+      const centerX = viewportSize.width / 2;
+      const centerY = viewportSize.height / 2;
+      const worldX = (centerX - curPan.x) / curZoom;
+      const worldY = (centerY - curPan.y) / curZoom;
+      const desiredZoom = Math.max(minZoom, Math.min(MAX_ZOOM, curZoom * factor));
+      let nextZoom = desiredZoom;
+      if (!bypassResistance && desiredZoom > curZoom) {
+        const fitZoom = Math.max(
+          minZoom,
+          Math.min(
+            (viewportSize.width / 2) /
+              Math.max(Math.abs(figureBounds.minX - worldX), Math.abs(figureBounds.maxX - worldX)),
+            (viewportSize.height / 2) /
+              Math.max(Math.abs(figureBounds.minY - worldY), Math.abs(figureBounds.maxY - worldY))
+          )
+        );
+        if (desiredZoom > fitZoom) {
+          nextZoom =
+            curZoom < fitZoom
+              ? fitZoom + (desiredZoom - fitZoom) * 0.18
+              : curZoom + (desiredZoom - curZoom) * 0.18;
+        }
+      }
+      nextZoom = Math.max(minZoom, Math.min(MAX_ZOOM, nextZoom));
       const nextPan = {
-        x: sx - worldX * nextZoom,
-        y: sy - worldY * nextZoom,
+        x: centerX - worldX * nextZoom,
+        y: centerY - worldY * nextZoom,
       };
       zoomRef.current = nextZoom;
       panRef.current = nextPan;
       enqueueScreenUpdate({ zoom: nextZoom, pan: nextPan });
     },
-    [enqueueScreenUpdate]
+    [enqueueScreenUpdate, figureBounds, viewportSize.height, viewportSize.width]
   );
+
+  useEffect(() => {
+    const svg = svgRef.current;
+    if (!svg) return;
+    svg.addEventListener('wheel', handleWheel, { passive: false });
+    return () => svg.removeEventListener('wheel', handleWheel);
+  }, [handleWheel]);
 
   const safeSetPointerCapture = useCallback((pointerId: number) => {
     try {
@@ -590,6 +743,12 @@ export const BookStageCanvas: React.FC<BookStageCanvasProps> = React.memo(({
       const lastCursorDeg =
         dist >= 4 ? (Math.atan2(world.y - pivot.y, world.x - pivot.x) * 180) / Math.PI : null;
       const rawAngle = targetJointId === 'pelvis' ? curArmature.rootRotation : runtime.localAngle;
+      const joints = computedJointsRef.current;
+      const groundY =
+        rigSystems?.pressurePlateY ??
+        rigSystems?.groundY ??
+        originOffset.y + canons.eightHeadTotalPx / 2;
+      const isLoinPivot = targetJointId === 'hipR' || targetJointId === 'hipL';
       safeSetPointerCapture(e.pointerId);
       setActiveDrag({
         type: 'fk_rotate',
@@ -598,14 +757,86 @@ export const BookStageCanvas: React.FC<BookStageCanvasProps> = React.memo(({
         pivotY: pivot.y,
         lastCursorDeg,
         rawAngle,
+        ...(isLoinPivot
+          ? {
+              startPelvis: { x: joints.pelvis.x, y: joints.pelvis.y },
+              startRootRotation: curArmature.rootRotation,
+              startLumbarAngle: curArmature.joints.lumbar.localAngle,
+              startThoraxAngle: curArmature.joints.thorax.localAngle,
+              startNeckAngle: curArmature.joints.neck.localAngle,
+              footRPin: getGroundContactPin(joints.footR, joints.toeR, groundY, 'R'),
+              footLPin: getGroundContactPin(joints.footL, joints.toeL, groundY, 'L'),
+            }
+          : {}),
       });
     },
-    [clientToRigWorld, safeSetPointerCapture, setActiveDrag]
+    [
+      canons.eightHeadTotalPx,
+      clientToRigWorld,
+      originOffset.y,
+      rigSystems?.groundY,
+      rigSystems?.pressurePlateY,
+      safeSetPointerCapture,
+      setActiveDrag,
+    ]
   );
+
+  const beginFaceplateLookDrag = useCallback(
+    (e: React.PointerEvent<SVGElement>) => {
+      e.stopPropagation();
+      onSelectJoint('lip');
+      const curArmature = armatureRef.current;
+      const runtime = curArmature.joints.lip;
+      if (!runtime || runtime.mode === 'PIN' || runtime.physicsMode === 'rigid') return;
+
+      const world = clientToRigWorld(e.clientX, e.clientY);
+      const faceplate = computedJointsRef.current.lip;
+      const startArmature = setJointMode(curArmature, 'lip', 'IK');
+      armatureRef.current = startArmature;
+      safeSetPointerCapture(e.pointerId);
+      setActiveDrag({
+        type: 'faceplate_look',
+        startArmature,
+        offsetX: faceplate.x - world.x,
+        offsetY: faceplate.y - world.y,
+      });
+      enqueueScreenUpdate({ armature: startArmature });
+    },
+    [
+      clientToRigWorld,
+      enqueueScreenUpdate,
+      onSelectJoint,
+      safeSetPointerCapture,
+      setActiveDrag,
+    ]
+  );
+
+  const beginNeckCollarMagnetDrag = useCallback(
+    (e: React.PointerEvent<SVGGElement>) => {
+      e.stopPropagation();
+      onSelectJoint('neck');
+      const world = clientToRigWorld(e.clientX, e.clientY);
+      const separation = armatureRef.current.neckCollarSeparation ?? { x: 0, y: 0 };
+      safeSetPointerCapture(e.pointerId);
+      setActiveDrag({
+        type: 'neck_collar_magnet',
+        startPointer: world,
+        startSeparation: separation,
+      });
+    },
+    [clientToRigWorld, onSelectJoint, safeSetPointerCapture, setActiveDrag]
+  );
+
+  const resetNeckCollarMagnet = useCallback(() => {
+    const reset = setNeckCollarSeparation(armatureRef.current, { x: 0, y: 0 });
+    armatureRef.current = reset;
+    onUpdateArmature(reset);
+    onCommitPoseHistory();
+  }, [onCommitPoseHistory, onUpdateArmature]);
 
   const handlePointerDownStage = useCallback(
     (e: React.PointerEvent<SVGSVGElement>) => {
-      if (e.button !== 0 && e.button !== 1) return;
+      if (e.button !== 1) return;
       beginPanDrag(e);
     },
     [beginPanDrag]
@@ -619,27 +850,82 @@ export const BookStageCanvas: React.FC<BookStageCanvasProps> = React.memo(({
       const world = clientToRigWorld(e.clientX, e.clientY);
       const joints = computedJointsRef.current;
       const pelvis = joints.pelvis;
+      const groundY =
+        rigSystems?.pressurePlateY ??
+        rigSystems?.groundY ??
+        originOffset.y + canons.eightHeadTotalPx / 2;
       safeSetPointerCapture(e.pointerId);
       setActiveDrag({
         type: 'waist_balance',
         startPelvis: { x: pelvis.x, y: pelvis.y },
         startRootRotation: curArmature.rootRotation,
         startLumbarAngle: curArmature.joints.lumbar.localAngle,
-        footRPin: {
-          x: joints.footR.x,
-          y: joints.footR.y,
-          worldAngle: joints.footR.worldAngle,
-        },
-        footLPin: {
-          x: joints.footL.x,
-          y: joints.footL.y,
-          worldAngle: joints.footL.worldAngle,
-        },
+        startThoraxAngle: curArmature.joints.thorax.localAngle,
+        startNeckAngle: curArmature.joints.neck.localAngle,
+        footRPin: getGroundContactPin(joints.footR, joints.toeR, groundY, 'R'),
+        footLPin: getGroundContactPin(joints.footL, joints.toeL, groundY, 'L'),
         offsetX: pelvis.x - world.x,
         offsetY: pelvis.y - world.y,
       });
     },
-    [clientToRigWorld, safeSetPointerCapture, setActiveDrag]
+    [
+      canons.eightHeadTotalPx,
+      clientToRigWorld,
+      originOffset.y,
+      rigSystems?.groundY,
+      rigSystems?.pressurePlateY,
+      safeSetPointerCapture,
+      setActiveDrag,
+    ]
+  );
+
+  const beginTorsoBalanceDrag = useCallback(
+    (e: React.PointerEvent<SVGGElement>, torsoCenter: Point2D) => {
+      e.stopPropagation();
+      const curArmature = armatureRef.current;
+      const lumbarRt = curArmature.joints.lumbar;
+      if (!lumbarRt || lumbarRt.mode === 'PIN' || lumbarRt.physicsMode === 'rigid') return;
+
+      onSelectJoint('lumbar');
+      const world = clientToRigWorld(e.clientX, e.clientY);
+      const joints = computedJointsRef.current;
+      const groundY =
+        rigSystems?.pressurePlateY ??
+        rigSystems?.groundY ??
+        originOffset.y + canons.eightHeadTotalPx / 2;
+      safeSetPointerCapture(e.pointerId);
+      setActiveDrag({
+        type: 'torso_balance',
+        startPelvis: { x: joints.pelvis.x, y: joints.pelvis.y },
+        startRootRotation: curArmature.rootRotation,
+        startLumbarAngle: curArmature.joints.lumbar.localAngle,
+        startThoraxAngle: curArmature.joints.thorax.localAngle,
+        startNeckAngle: curArmature.joints.neck.localAngle,
+        footRPin: getGroundContactPin(joints.footR, joints.toeR, groundY, 'R'),
+        footLPin: getGroundContactPin(joints.footL, joints.toeL, groundY, 'L'),
+        offsetX: torsoCenter.x - world.x,
+        offsetY: torsoCenter.y - world.y,
+      });
+    },
+    [clientToRigWorld, onSelectJoint, safeSetPointerCapture, setActiveDrag]
+  );
+
+  const beginPressurePlateDrag = useCallback(
+    (e: React.PointerEvent<SVGPathElement>) => {
+      e.stopPropagation();
+      const joints = computedJointsRef.current;
+      const pressureY =
+        rigSystems?.pressurePlateY ??
+        Math.max(joints.footR.y, joints.toeR.y, joints.footL.y, joints.toeL.y);
+      const world = clientToRigWorld(e.clientX, e.clientY);
+      safeSetPointerCapture(e.pointerId);
+      setActiveDrag({
+        type: 'pressure_plate',
+        startArmature: armatureRef.current,
+        offsetY: pressureY - world.y,
+      });
+    },
+    [clientToRigWorld, rigSystems?.pressurePlateY, safeSetPointerCapture, setActiveDrag]
   );
 
   const handlePointerDownHipToggle = useCallback(
@@ -695,8 +981,16 @@ export const BookStageCanvas: React.FC<BookStageCanvasProps> = React.memo(({
 
   const handlePointerDownJoint = useCallback(
     (e: React.PointerEvent<SVGGElement>, jointId: JointId) => {
+      if (jointId === 'lip') {
+        beginFaceplateLookDrag(e);
+        return;
+      }
       e.stopPropagation();
       onSelectJoint(jointId);
+      if (jointId === 'handR' || jointId === 'handL') {
+        startCumulativeFKRotate(e, jointId);
+        return;
+      }
       const curArmature = armatureRef.current;
       const joint = computedJointsRef.current[jointId];
       const spec = JOINT_SPEC_MAP[jointId];
@@ -746,9 +1040,14 @@ export const BookStageCanvas: React.FC<BookStageCanvasProps> = React.memo(({
       startCumulativeFKRotate(e, targetId);
     },
     [
+      beginFaceplateLookDrag,
       beginWaistBalanceDrag,
       clientToRigWorld,
+      canons.eightHeadTotalPx,
+      originOffset.y,
       onSelectJoint,
+      rigSystems?.groundY,
+      rigSystems?.pressurePlateY,
       safeSetPointerCapture,
       setActiveDrag,
       startCumulativeFKRotate,
@@ -757,8 +1056,22 @@ export const BookStageCanvas: React.FC<BookStageCanvasProps> = React.memo(({
 
   const handlePointerDownBone = useCallback(
     (e: React.PointerEvent<SVGElement>, jointId: JointId) => {
+      if (jointId === 'lip') {
+        beginFaceplateLookDrag(e);
+        return;
+      }
       e.stopPropagation();
-      onSelectJoint(jointId);
+      const clawJointId: JointId | null =
+        jointId === 'handR' || jointId === 'fingerR'
+          ? 'handR'
+          : jointId === 'handL' || jointId === 'fingerL'
+            ? 'handL'
+            : null;
+      onSelectJoint(clawJointId ?? jointId);
+      if (clawJointId) {
+        startCumulativeFKRotate(e, clawJointId);
+        return;
+      }
       // Dragging the waist bowl activates grounded balance / hula / squat without moving feet
       if (jointId === 'pelvis') {
         beginWaistBalanceDrag(e);
@@ -788,6 +1101,7 @@ export const BookStageCanvas: React.FC<BookStageCanvasProps> = React.memo(({
       startCumulativeFKRotate(e, drivenJointId);
     },
     [
+      beginFaceplateLookDrag,
       beginWaistBalanceDrag,
       clientToRigWorld,
       onSelectJoint,
@@ -798,8 +1112,8 @@ export const BookStageCanvas: React.FC<BookStageCanvasProps> = React.memo(({
   );
 
   const handlePointerMove = useCallback(
-    (e: React.PointerEvent<SVGSVGElement>) => {
-      const mediaWorld = clientToSvgWorld(e.clientX, e.clientY);
+    ({ clientX, clientY }: Pick<React.PointerEvent<SVGSVGElement>, 'clientX' | 'clientY'>) => {
+      const mediaWorld = clientToSvgWorld(clientX, clientY);
       const world = worldToMedia(mediaWorld, stageTransformRef.current, originOffset);
       const cursorPatch = {
         hasCursor: true,
@@ -817,8 +1131,8 @@ export const BookStageCanvas: React.FC<BookStageCanvasProps> = React.memo(({
 
       if (activeDrag.type === 'pan') {
         const nextPan = {
-          x: activeDrag.startPanX + (e.clientX - activeDrag.startClientX),
-          y: activeDrag.startPanY + (e.clientY - activeDrag.startClientY),
+          x: activeDrag.startPanX + (clientX - activeDrag.startClientX),
+          y: activeDrag.startPanY + (clientY - activeDrag.startClientY),
         };
         panRef.current = nextPan;
         enqueueScreenUpdate({ ...cursorPatch, pan: nextPan });
@@ -843,7 +1157,51 @@ export const BookStageCanvas: React.FC<BookStageCanvasProps> = React.memo(({
         return;
       }
 
+      if (activeDrag.type === 'pressure_plate') {
+        const solution = solvePressurePlateContact(
+          activeDrag.startArmature,
+          world.y + activeDrag.offsetY,
+          originOffset
+        );
+        onUpdateRigSystems?.({ pressurePlateY: solution.pressurePlateY });
+        armatureRef.current = solution.armature;
+        enqueueScreenUpdate({ ...cursorPatch, armature: solution.armature });
+        return;
+      }
+
       const curArmature = armatureRef.current;
+
+      if (activeDrag.type === 'neck_collar_magnet') {
+        const nextArmature = setNeckCollarSeparation(curArmature, {
+          x: activeDrag.startSeparation.x + world.x - activeDrag.startPointer.x,
+          y: activeDrag.startSeparation.y + world.y - activeDrag.startPointer.y,
+        });
+        armatureRef.current = nextArmature;
+        enqueueScreenUpdate({ ...cursorPatch, armature: nextArmature });
+        return;
+      }
+
+      if (activeDrag.type === 'faceplate_look') {
+        const nextArmature = solveFaceplateLookIK(
+          activeDrag.startArmature,
+          world.x + activeDrag.offsetX,
+          world.y + activeDrag.offsetY,
+          originOffset,
+          activeDrag.collarHold
+        );
+        dragRef.current = {
+          ...activeDrag,
+          collarHold: {
+            braceR: nextArmature.joints.braceR.localAngle,
+            braceL: nextArmature.joints.braceL.localAngle,
+            clavOuterR: nextArmature.joints.clavOuterR.localAngle,
+            clavOuterL: nextArmature.joints.clavOuterL.localAngle,
+          },
+        };
+        armatureRef.current = nextArmature;
+        enqueueScreenUpdate({ ...cursorPatch, armature: nextArmature });
+        return;
+      }
 
       if (activeDrag.type === 'root_translate') {
         const nextArmature: ArmatureState = {
@@ -869,7 +1227,34 @@ export const BookStageCanvas: React.FC<BookStageCanvasProps> = React.memo(({
           {
             baseRootRotation: activeDrag.startRootRotation,
             baseLumbarAngle: activeDrag.startLumbarAngle,
+            baseThoraxAngle: activeDrag.startThoraxAngle,
+            baseNeckAngle: activeDrag.startNeckAngle,
             startPelvisX: activeDrag.startPelvis.x,
+            startPelvisY: activeDrag.startPelvis.y,
+          }
+        );
+        armatureRef.current = nextArmature;
+        enqueueScreenUpdate({ ...cursorPatch, armature: nextArmature });
+        return;
+      }
+
+      if (activeDrag.type === 'torso_balance') {
+        const targetTorsoX = world.x + activeDrag.offsetX;
+        const targetTorsoY = world.y + activeDrag.offsetY;
+        const nextArmature = solveTorsoBalance(
+          curArmature,
+          targetTorsoX,
+          targetTorsoY,
+          activeDrag.footRPin,
+          activeDrag.footLPin,
+          originOffset,
+          {
+            baseRootRotation: activeDrag.startRootRotation,
+            baseLumbarAngle: activeDrag.startLumbarAngle,
+            baseThoraxAngle: activeDrag.startThoraxAngle,
+            baseNeckAngle: activeDrag.startNeckAngle,
+            startPelvisX: activeDrag.startPelvis.x,
+            startPelvisY: activeDrag.startPelvis.y,
           }
         );
         armatureRef.current = nextArmature;
@@ -908,8 +1293,8 @@ export const BookStageCanvas: React.FC<BookStageCanvasProps> = React.memo(({
 
       if (activeDrag.type === 'arm_swivel') {
         const moveDist = Math.hypot(
-          e.clientX - activeDrag.startClientX,
-          e.clientY - activeDrag.startClientY
+          clientX - activeDrag.startClientX,
+          clientY - activeDrag.startClientY
         );
         if (!activeDrag.hasDragged && moveDist < 5) {
           enqueueScreenUpdate(cursorPatch);
@@ -918,7 +1303,7 @@ export const BookStageCanvas: React.FC<BookStageCanvasProps> = React.memo(({
         if (!activeDrag.hasDragged) {
           dragRef.current = { ...activeDrag, hasDragged: true };
         }
-        const deltaDeg = (e.clientY - activeDrag.startClientY) * 1.4;
+        const deltaDeg = (clientY - activeDrag.startClientY) * 1.4;
         const rawNext = normalizeAngleDeg(activeDrag.startSwivelDeg + deltaDeg);
         const snappedNext =
           Math.abs(rawNext) < 14
@@ -1041,7 +1426,7 @@ export const BookStageCanvas: React.FC<BookStageCanvasProps> = React.memo(({
           isClosedTriangleSwivel && swivelLimits
             ? Math.max(swivelLimits[0], Math.min(swivelLimits[1], constrainedAngle))
             : constrainedAngle;
-        const nextArmature: ArmatureState =
+        let nextArmature: ArmatureState =
           targetJointId === 'pelvis'
             ? {
                 ...curArmature,
@@ -1057,15 +1442,73 @@ export const BookStageCanvas: React.FC<BookStageCanvasProps> = React.memo(({
                   },
                 },
               };
+        if (
+          (targetJointId === 'hipR' || targetJointId === 'hipL') &&
+          activeDrag.startPelvis &&
+          activeDrag.footRPin &&
+          activeDrag.footLPin
+        ) {
+          nextArmature = solveWaistBalanceHula(
+            nextArmature,
+            activeDrag.startPelvis.x,
+            activeDrag.startPelvis.y,
+            activeDrag.footRPin,
+            activeDrag.footLPin,
+            originOffset,
+            {
+              baseRootRotation: activeDrag.startRootRotation,
+              baseLumbarAngle: activeDrag.startLumbarAngle,
+              baseThoraxAngle: activeDrag.startThoraxAngle,
+              baseNeckAngle: activeDrag.startNeckAngle,
+              startPelvisX: activeDrag.startPelvis.x,
+              startPelvisY: activeDrag.startPelvis.y,
+            }
+          );
+        }
         armatureRef.current = nextArmature;
         enqueueScreenUpdate({ ...cursorPatch, armature: nextArmature });
       }
     },
-    [clientToSvgWorld, enqueueScreenUpdate, onUpdateStageTransform, onUpdateWorldPin, onVanishingPointChange, originOffset, rigSystems?.softLimits, rigSystems?.solver]
+    [
+      clientToSvgWorld,
+      enqueueScreenUpdate,
+      onUpdateRigSystems,
+      onUpdateStageTransform,
+      onUpdateWorldPin,
+      onVanishingPointChange,
+      originOffset,
+      rigSystems?.softLimits,
+      rigSystems?.solver,
+    ]
   );
+
+  const queuePointerMove = useCallback(
+    (clientX: number, clientY: number) => {
+      pendingPointerMoveRef.current = { clientX, clientY };
+      if (pointerMoveFrameRef.current !== null) return;
+      pointerMoveFrameRef.current = window.requestAnimationFrame(() => {
+        pointerMoveFrameRef.current = null;
+        const pending = pendingPointerMoveRef.current;
+        pendingPointerMoveRef.current = null;
+        if (pending) handlePointerMove(pending);
+      });
+    },
+    [handlePointerMove]
+  );
+
+  const flushPendingPointerMove = useCallback(() => {
+    if (pointerMoveFrameRef.current !== null) {
+      window.cancelAnimationFrame(pointerMoveFrameRef.current);
+      pointerMoveFrameRef.current = null;
+    }
+    const pending = pendingPointerMoveRef.current;
+    pendingPointerMoveRef.current = null;
+    if (pending) handlePointerMove(pending);
+  }, [handlePointerMove]);
 
   const handlePointerUp = useCallback(
     (e: React.PointerEvent<SVGSVGElement>) => {
+      flushPendingPointerMove();
       if (svgRef.current?.hasPointerCapture(e.pointerId)) {
         svgRef.current.releasePointerCapture(e.pointerId);
       }
@@ -1085,8 +1528,12 @@ export const BookStageCanvas: React.FC<BookStageCanvasProps> = React.memo(({
         activeDrag &&
         (activeDrag.type === 'fk_rotate' ||
           activeDrag.type === 'ik' ||
+          activeDrag.type === 'faceplate_look' ||
           activeDrag.type === 'root_translate' ||
           activeDrag.type === 'waist_balance' ||
+          activeDrag.type === 'torso_balance' ||
+          activeDrag.type === 'pressure_plate' ||
+          activeDrag.type === 'neck_collar_magnet' ||
           activeDrag.type === 'hip_toggle' ||
           activeDrag.type === 'collar_toggle' ||
           activeDrag.type === 'arm_swivel')
@@ -1095,7 +1542,14 @@ export const BookStageCanvas: React.FC<BookStageCanvasProps> = React.memo(({
       }
       setActiveDrag(null);
     },
-    [flushScreenFrame, onAnimateArmature, onCommitPoseHistory, onUpdateArmature, setActiveDrag]
+    [
+      flushPendingPointerMove,
+      flushScreenFrame,
+      onAnimateArmature,
+      onCommitPoseHistory,
+      onUpdateArmature,
+      setActiveDrag,
+    ]
   );
 
   const isPlateMedia = effectiveMedia.kind === 'image' || effectiveMedia.kind === 'video';
@@ -1118,6 +1572,58 @@ export const BookStageCanvas: React.FC<BookStageCanvasProps> = React.memo(({
   const wsX = originOffset.x - wsHalf;
   const wsY = originOffset.y - wsHalf;
   const navelCenter = computedJoints.lumbar ?? originOffset;
+  const pressurePlateY = Math.max(
+    computedJoints.footR.y,
+    computedJoints.toeR.endY,
+    computedJoints.footL.y,
+    computedJoints.toeL.endY
+  );
+  const staticGroundY =
+    rigSystems?.groundY ?? originOffset.y + canons.eightHeadTotalPx / 2;
+  const activePressurePlateY = rigSystems?.pressurePlateY ?? pressurePlateY;
+  const isPointGrounded = (y: number) =>
+    Math.abs(y - activePressurePlateY) <= GROUND_CONTACT_TOLERANCE_PX;
+  const groundedFootCount = [
+    [computedJoints.footR.y, computedJoints.toeR.endY],
+    [computedJoints.footL.y, computedJoints.toeL.endY],
+  ].filter((points) => points.some(isPointGrounded)).length;
+  const groundedBodyIds: JointId[] = [
+    'pelvis',
+    'hipR',
+    'hipL',
+    'lumbar',
+    'ribR',
+    'ribL',
+    'thorax',
+    'head',
+    'humerusR',
+    'forearmR',
+    'handR',
+    'fingerTipR',
+    'humerusL',
+    'forearmL',
+    'handL',
+    'fingerTipL',
+  ];
+  const groundedBodyContact = groundedBodyIds.some((id) => {
+    const joint = computedJoints[id];
+    return Math.max(joint.y, joint.endY) >= activePressurePlateY - GROUND_CONTACT_TOLERANCE_PX;
+  });
+  const pressureLevel = Math.max(
+    0,
+    Math.min(
+      1,
+      0.5 +
+        (staticGroundY - activePressurePlateY) / 160 +
+        (groundedBodyContact ? 0.12 : 0)
+    )
+  );
+  const pressurePlateSlopePx = (1 - pressureLevel) * 5;
+  const pressurePlateControlY = activePressurePlateY + pressureLevel * 1.25;
+  const pressurePlatePath =
+    `M ${endlessBounds.minX} ${activePressurePlateY + pressurePlateSlopePx} ` +
+    `Q ${(endlessBounds.minX + endlessBounds.maxX) / 2} ${pressurePlateControlY} ` +
+    `${endlessBounds.maxX} ${activePressurePlateY - pressurePlateSlopePx}`;
   const calibratedStageTransform = buildStageSvgTransform(effectiveTransform, originOffset);
   const isMotionActive = isPoseTransitioning || isPlaying || dragState !== null;
 
@@ -1269,15 +1775,24 @@ export const BookStageCanvas: React.FC<BookStageCanvasProps> = React.memo(({
         className={`relative w-full h-full block touch-none transition-opacity duration-200 ${
           showCoverWorkspace ? 'opacity-100' : 'opacity-0 pointer-events-none'
         }`}
-        onWheel={handleWheel}
         onContextMenu={(e) => e.preventDefault()}
         onPointerDownCapture={(e) => {
           if (e.button === 0) {
             pointerDownPosRef.current = { x: e.clientX, y: e.clientY };
+            if (e.metaKey && e.shiftKey) {
+              e.preventDefault();
+              e.stopPropagation();
+              beginPanDrag(e);
+            }
           }
           if (e.button === 2) {
             e.preventDefault();
             e.stopPropagation();
+            safeSetPointerCapture(e.pointerId);
+            if (rightClickTimerRef.current !== null) {
+              window.clearTimeout(rightClickTimerRef.current);
+              rightClickTimerRef.current = null;
+            }
             const now = performance.now();
             const prev = lastRightClickRef.current;
             if (
@@ -1294,13 +1809,31 @@ export const BookStageCanvas: React.FC<BookStageCanvasProps> = React.memo(({
               }
             } else {
               lastRightClickRef.current = { time: now, x: e.clientX, y: e.clientY };
+              rightClickTimerRef.current = window.setTimeout(() => {
+                rightClickTimerRef.current = null;
+                lastRightClickRef.current = null;
+                void Promise.resolve(onCopyPoseData()).then(() => {
+                  setLastExportKind('clipboard');
+                });
+              }, 600);
             }
           }
         }}
         onPointerDown={handlePointerDownStage}
-        onPointerMove={handlePointerMove}
+        onPointerMove={(e) => queuePointerMove(e.clientX, e.clientY)}
+        onPointerUpCapture={(e) => {
+          if (e.button !== 2 || rightClickTimerRef.current === null) return;
+          window.clearTimeout(rightClickTimerRef.current);
+          rightClickTimerRef.current = null;
+        }}
+        onPointerCancelCapture={() => {
+          if (rightClickTimerRef.current === null) return;
+          window.clearTimeout(rightClickTimerRef.current);
+          rightClickTimerRef.current = null;
+        }}
         onPointerUp={handlePointerUp}
         onPointerLeave={() => {
+          flushPendingPointerMove();
           enqueueScreenUpdate({ hasCursor: true, cursor: null });
           flushScreenFrame(true);
         }}
@@ -1329,6 +1862,10 @@ export const BookStageCanvas: React.FC<BookStageCanvasProps> = React.memo(({
           if (leftClickTimerRef.current !== null) {
             window.clearTimeout(leftClickTimerRef.current);
             leftClickTimerRef.current = null;
+          }
+          if (rightClickTimerRef.current !== null) {
+            window.clearTimeout(rightClickTimerRef.current);
+            rightClickTimerRef.current = null;
           }
 
           if (nextCount >= 3) {
@@ -1708,8 +2245,8 @@ export const BookStageCanvas: React.FC<BookStageCanvasProps> = React.memo(({
                 y1={vanishingPoint.y}
                 x2={endlessBounds.maxX}
                 y2={vanishingPoint.y}
-                stroke={darkMode ? 'rgba(94, 234, 212, 0.34)' : 'rgba(13, 148, 136, 0.38)'}
-                strokeWidth={1.2}
+                stroke={darkMode ? 'rgba(216, 180, 254, 0.46)' : 'rgba(95, 0, 128, 0.28)'}
+                strokeWidth={1.6}
                 strokeDasharray="6 4"
                 vectorEffect="non-scaling-stroke"
                 pointerEvents="none"
@@ -1765,6 +2302,48 @@ export const BookStageCanvas: React.FC<BookStageCanvasProps> = React.memo(({
             </g>
           )}
 
+          <line
+            data-ground-reference="true"
+            x1={endlessBounds.minX}
+            y1={staticGroundY}
+            x2={endlessBounds.maxX}
+            y2={staticGroundY}
+            stroke="#14532D"
+            strokeOpacity={darkMode ? 0.42 : 0.3}
+            strokeWidth={1.1}
+            strokeDasharray="9 6"
+            vectorEffect="non-scaling-stroke"
+            pointerEvents="none"
+          />
+          <path
+            data-ground-line="true"
+            data-pressure-plate="true"
+            data-pressure-level={pressureLevel.toFixed(2)}
+            data-grounded-foot-count={groundedFootCount}
+            data-grounded-body-contact={groundedBodyContact ? 'true' : 'false'}
+            d={pressurePlatePath}
+            fill="none"
+            stroke={
+              groundedFootCount === 0
+                ? REPO_STRAIN_CRIMSON
+                : isGroundLineHovered
+                ? '#6EE7B7'
+                : '#14532D'
+            }
+            strokeOpacity={
+              isGroundLineHovered ? 0.96 : groundedFootCount === 0 ? 0.9 : darkMode ? 0.8 : 0.72
+            }
+            strokeWidth={isGroundLineHovered ? 2.2 : 1.6}
+            vectorEffect="non-scaling-stroke"
+            pointerEvents="stroke"
+            style={{ cursor: 'ns-resize' }}
+            onPointerEnter={() => setIsGroundLineHovered(true)}
+            onPointerLeave={() => setIsGroundLineHovered(false)}
+            onPointerDown={beginPressurePlateDrag}
+          >
+            <title>Drag vertically to change ground pressure; toes compensate within joint limits</title>
+          </path>
+
           {/* Pure Data Procedural SVG Digital Bones Puppet */}
           <DigitalMannequin
             armature={armature}
@@ -1779,6 +2358,9 @@ export const BookStageCanvas: React.FC<BookStageCanvasProps> = React.memo(({
             onPointerDownBone={handlePointerDownBone}
             onPointerDownHipToggle={handlePointerDownHipToggle}
             onPointerDownArmSwivel={handlePointerDownArmSwivel}
+            onPointerDownNeckCollarMagnet={beginNeckCollarMagnetDrag}
+            onResetNeckCollarMagnet={resetNeckCollarMagnet}
+            onPointerDownTorso={beginTorsoBalanceDrag}
           />
           </g>
 

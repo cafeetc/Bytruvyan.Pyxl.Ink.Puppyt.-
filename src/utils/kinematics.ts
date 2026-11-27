@@ -1,6 +1,8 @@
 import {
   COLLAR_LINK_SCALE,
+  FACEPLATE_SLIDE_LIMIT_SVG,
   PUPPYT_LANDMARKS,
+  TORSO_HANDLE_CENTER_SVG,
   JOINT_SPECS,
   JOINT_SPEC_MAP,
   CANONICAL_RIG_PARENTS,
@@ -16,6 +18,7 @@ import {
   CaveArtRigGeometry,
   ComputedJoint,
   EnvironmentalAnchorId,
+  GroundContactPin,
   JointId,
   JointMode,
   JointRuntimeState,
@@ -34,6 +37,10 @@ export type Affine2D = readonly [number, number, number, number, number, number]
 
 const DEG_TO_RAD = Math.PI / 180;
 const RAD_TO_DEG = 180 / Math.PI;
+
+function softSaturate(value: number, limit: number): number {
+  return limit * Math.tanh(value / limit);
+}
 
 export function mulAffine(a: Affine2D, b: Affine2D): Affine2D {
   return [
@@ -307,6 +314,10 @@ export function createPosePreset(
     hipToggleSign: existingState?.hipToggleSign ?? 1,
     armSwivelR: 0,
     armSwivelL: 0,
+    faceplateOffsetX: 0,
+    faceplateOffsetY: 0,
+    neckLift: 0,
+    neckCollarSeparation: { x: 0, y: 0 },
     continuousSpin: existingState?.continuousSpin ?? true,
     internalKeystone: existingState?.internalKeystone ?? 'navel',
     environmentalAnchor: existingState?.environmentalAnchor ?? 'navel',
@@ -332,6 +343,8 @@ export const HIP_BRIDGE_LINK_STAGE_PX =
 export const COLLAR_INWARD_NORMAL_LIMIT_DEG = 16;
 export const COLLAR_INWARD_RESISTANCE_START_DEG = 11.5;
 export const COLLAR_INWARD_BREAKAWAY_DEG = 21.5;
+const NECK_LIFT_MAX_SWIVEL_SPLAY_DEG = 16;
+const COLLAR_EXPLICIT_UP_THRESHOLD_DEG = 1;
 export const COLLAR_UNSNAP_HYSTERESIS_DEG = 18.0;
 export const COLLAR_SWIVEL_MAX_INWARD_DEG = 48;
 export const SWIVEL_REST_OFFSET_DEG = Math.atan2(99, 267) * RAD_TO_DEG;
@@ -606,7 +619,10 @@ export function resolveCollarToggleFold(
   acroLiftPx = 0
 ): { foldSign: 1 | -1; effectiveFoldMag: number; effectiveLocalAngle: number; upEase: number } {
   const clampedInput = Math.max(-65, Math.min(65, effLocalAngle));
-  const explicitUp = side === 'R' ? clampedInput > 1e-4 : clampedInput < -1e-4;
+  const explicitUp =
+    side === 'R'
+      ? clampedInput > COLLAR_EXPLICIT_UP_THRESHOLD_DEG
+      : clampedInput < -COLLAR_EXPLICIT_UP_THRESHOLD_DEG;
 
   // Smoothly ramp upward ease (0 -> 1) when arm lifts past +22° overhead or shoulder elevates past +10px
   const armEase = Math.max(0, Math.min(1, (armElevDeg - 22) / 30));
@@ -646,8 +662,52 @@ export function resolveCollarToggleFold(
   };
 }
 
+export function clampNeckCollarSeparation(separation: Point2D): Point2D {
+  const neckSpec = JOINT_SPEC_MAP.neck;
+  const neckLengthSvg = neckSpec.restTip
+    ? Math.hypot(
+        neckSpec.restTip[0] - neckSpec.restPivot[0],
+        neckSpec.restTip[1] - neckSpec.restPivot[1]
+      ) / SVG_MODEL_CONSTANTS.puppytScaleFactor
+    : 0;
+  const maxSeparationPx =
+    (neckLengthSvg / 2) *
+    SVG_MODEL_CONSTANTS.puppytScaleFactor *
+    PUPPYT_TO_EVOLVED_SCALE;
+  const separationLength = Math.hypot(separation.x, separation.y);
+  if (separationLength <= maxSeparationPx || separationLength <= 1e-8) return separation;
+  const scale = maxSeparationPx / separationLength;
+  return { x: separation.x * scale, y: separation.y * scale };
+}
+
+export function setNeckCollarSeparation(
+  state: ArmatureState,
+  separation: Point2D
+): ArmatureState {
+  return { ...state, neckCollarSeparation: clampNeckCollarSeparation(separation) };
+}
+
 function evaluateRawArmature(state: ArmatureState): Record<JointId, ComputedJoint> {
   const computed = {} as Record<JointId, ComputedJoint>;
+  const neckSpec = JOINT_SPEC_MAP.neck;
+  const neckLengthSvg = neckSpec.restTip
+    ? Math.hypot(
+        neckSpec.restTip[0] - neckSpec.restPivot[0],
+        neckSpec.restTip[1] - neckSpec.restPivot[1]
+      ) / SVG_MODEL_CONSTANTS.puppytScaleFactor
+    : 0;
+  const maxNeckLift = neckLengthSvg / 2;
+  const neckSeparation = clampNeckCollarSeparation(state.neckCollarSeparation ?? { x: 0, y: 0 });
+  const neckLiftRatio =
+    maxNeckLift > 0 ? Math.max(0, Math.min(1, (state.neckLift ?? 0) / maxNeckLift)) : 0;
+  const maxSeparationPx =
+    maxNeckLift * SVG_MODEL_CONSTANTS.puppytScaleFactor * PUPPYT_TO_EVOLVED_SCALE;
+  const separationRatio =
+    maxSeparationPx > 0
+      ? Math.max(0, Math.min(1, Math.hypot(neckSeparation.x, neckSeparation.y) / maxSeparationPx))
+      : 0;
+  const neckCollarPressureRatio = Math.max(neckLiftRatio, separationRatio);
+  const easedNeckLift = neckCollarPressureRatio ** 2 * (3 - 2 * neckCollarPressureRatio);
 
   // Pre-compute rigid non-stretching hip pair so 2-bone hip bridge never stretches beyond maxSpan
   const pelvisScaleLen = Math.max(
@@ -752,7 +812,36 @@ function evaluateRawArmature(state: ArmatureState): Record<JointId, ComputedJoin
     }
 
     const parent = computed[spec.parentId];
-    const originPt = applyAffine(parent.boneMatrix, spec.restPivot[0], spec.restPivot[1]);
+    let pivotX = spec.restPivot[0];
+    let pivotY = spec.restPivot[1];
+    if (spec.id === 'neck') {
+      const neckLength = spec.restTip
+        ? Math.hypot(spec.restTip[0] - spec.restPivot[0], spec.restTip[1] - spec.restPivot[1]) /
+          SVG_MODEL_CONSTANTS.puppytScaleFactor
+        : 0;
+      const neckLift = Math.max(0, Math.min(neckLength / 2, state.neckLift ?? 0));
+      pivotY -= neckLift * SVG_MODEL_CONSTANTS.puppytScaleFactor;
+    } else if (spec.id === 'lip') {
+      const offsetX = Math.max(
+        -FACEPLATE_SLIDE_LIMIT_SVG,
+        Math.min(FACEPLATE_SLIDE_LIMIT_SVG, state.faceplateOffsetX ?? 0)
+      );
+      const offsetY = Math.max(
+        -FACEPLATE_SLIDE_LIMIT_SVG,
+        Math.min(FACEPLATE_SLIDE_LIMIT_SVG, state.faceplateOffsetY ?? 0)
+      );
+      pivotX += offsetX * SVG_MODEL_CONSTANTS.puppytScaleFactor;
+      pivotY += offsetY * SVG_MODEL_CONSTANTS.puppytScaleFactor;
+    }
+    const originPt = applyAffine(parent.boneMatrix, pivotX, pivotY);
+    if (
+      spec.id === 'neck' ||
+      spec.id === 'swivelR' ||
+      spec.id === 'swivelL'
+    ) {
+      originPt.x += neckSeparation.x;
+      originPt.y += neckSeparation.y;
+    }
     const restWorldDeg = spec.restTip
       ? vecAngleDeg(spec.restPivot, spec.restTip)
       : parent.restWorldDeg;
@@ -820,6 +909,10 @@ function evaluateRawArmature(state: ArmatureState): Record<JointId, ComputedJoin
       const isRight = spec.id === 'braceR';
       const side: 'R' | 'L' = isRight ? 'R' : 'L';
       const thorax = computed.thorax;
+      const collarAnchor = {
+        x: thorax.x + neckSeparation.x,
+        y: thorax.y + neckSeparation.y,
+      };
       const lumbar = computed.lumbar;
       const acromion = computed[isRight ? 'acromionR' : 'acromionL'];
       const halfClavLen =
@@ -852,7 +945,7 @@ function evaluateRawArmature(state: ArmatureState): Record<JointId, ComputedJoin
         acroLiftPx
       );
       const toggle = solveToggleHinge2Link(
-        thorax,
+        collarAnchor,
         acromion,
         halfClavLen,
         foldSign,
@@ -862,11 +955,11 @@ function evaluateRawArmature(state: ArmatureState): Record<JointId, ComputedJoin
       const midX = toggle.pMid.x;
       const midY = toggle.pMid.y;
 
-      const worldAngle = Math.atan2(midY - thorax.y, midX - thorax.x) * RAD_TO_DEG;
+      const worldAngle = Math.atan2(midY - collarAnchor.y, midX - collarAnchor.x) * RAD_TO_DEG;
       const cumulativeDeltaDeg = normalizeAngleDeg(worldAngle - restWorldDeg);
       const matrix = composeBoneMatrix(
-        thorax.x,
-        thorax.y,
+        collarAnchor.x,
+        collarAnchor.y,
         worldAngle,
         PUPPYT_TO_EVOLVED_SCALE * COLLAR_LINK_SCALE,
         PUPPYT_TO_EVOLVED_SCALE * scaleWid,
@@ -878,8 +971,8 @@ function evaluateRawArmature(state: ArmatureState): Record<JointId, ComputedJoin
       computed[spec.id] = {
         id: spec.id,
         spec,
-        x: thorax.x,
-        y: thorax.y,
+        x: collarAnchor.x,
+        y: collarAnchor.y,
         endX: midX,
         endY: midY,
         parentX: parent.x,
@@ -963,6 +1056,10 @@ function evaluateRawArmature(state: ArmatureState): Record<JointId, ComputedJoin
       collarResistanceRatio = behavior.resistanceRatio;
 
       const thorax = computed.thorax;
+      const collarAnchor = {
+        x: thorax.x + neckSeparation.x,
+        y: thorax.y + neckSeparation.y,
+      };
       const thoraxTilt = thorax ? thorax.localAngle : (state.joints.thorax?.localAngle ?? 0);
       if (behavior.snapState === 'snapped') {
         bondedLocalAngle = Math.max(
@@ -978,6 +1075,13 @@ function evaluateRawArmature(state: ArmatureState): Record<JointId, ComputedJoin
           )
         );
       }
+
+      const outwardSplay = NECK_LIFT_MAX_SWIVEL_SPLAY_DEG * easedNeckLift;
+      bondedLocalAngle += isRight ? -outwardSplay : outwardSplay;
+      bondedLocalAngle = Math.max(
+        spec.limits?.[0] ?? -COLLAR_INWARD_NORMAL_LIMIT_DEG,
+        Math.min(spec.limits?.[1] ?? COLLAR_INWARD_NORMAL_LIMIT_DEG, bondedLocalAngle)
+      );
 
       // Enforce strict non-stretching rigid two-piece collarbone reach via circle-circle intersection
       const braceSpec = JOINT_SPEC_MAP[isRight ? 'braceR' : 'braceL'];
@@ -1002,17 +1106,20 @@ function evaluateRawArmature(state: ArmatureState): Record<JointId, ComputedJoin
       const desiredWorldRad = desiredWorldDeg * DEG_TO_RAD;
       const desiredAcroX = originPt.x + swivelRadius * Math.cos(desiredWorldRad);
       const desiredAcroY = originPt.y + swivelRadius * Math.sin(desiredWorldRad);
-      const desiredChordDist = Math.hypot(desiredAcroX - thorax.x, desiredAcroY - thorax.y);
+      const desiredChordDist = Math.hypot(
+        desiredAcroX - collarAnchor.x,
+        desiredAcroY - collarAnchor.y
+      );
 
       if (desiredChordDist > allowedChord + 1e-4) {
-        const sx = thorax.x - originPt.x;
-        const sy = thorax.y - originPt.y;
+        const sx = collarAnchor.x - originPt.x;
+        const sy = collarAnchor.y - originPt.y;
         const dSpine = Math.hypot(sx, sy);
         if (dSpine > 1e-4) {
           const ux = sx / dSpine;
           const uy = sy / dSpine;
-          const latX = isRight ? uy : -uy;
-          const latY = isRight ? -ux : ux;
+          const latX = isRight ? -uy : uy;
+          const latY = isRight ? ux : -ux;
           const a = Math.max(
             -swivelRadius,
             Math.min(
@@ -1099,6 +1206,7 @@ function evaluateRawArmature(state: ArmatureState): Record<JointId, ComputedJoin
       boneMatrix: matrix,
       ...(collarSnapState !== undefined ? { collarSnapState } : {}),
       ...(collarResistanceRatio !== undefined ? { collarResistanceRatio } : {}),
+      ...(spec.id === 'neck' ? { neckCollarPressureRatio } : {}),
       ...(armReverseFactor !== undefined ? { armReverseFactor } : {}),
     };
   }
@@ -1158,6 +1266,92 @@ export function computeArmature(
     };
   }
   return pinned;
+}
+
+export function computeTorsoCenter(computed: Record<JointId, ComputedJoint>): Point2D {
+  const lumbarSvgMatrix = computeSvgBoneMatrix(computed.lumbar.boneMatrix);
+  return applyAffine(lumbarSvgMatrix, TORSO_HANDLE_CENTER_SVG[0], TORSO_HANDLE_CENTER_SVG[1]);
+}
+
+export interface BodyBalanceCenters {
+  upper: Point2D;
+  lower: Point2D;
+  whole: Point2D;
+  upperMass: number;
+  lowerMass: number;
+}
+
+const UPPER_BALANCE_SEGMENTS: readonly JointId[] = [
+  'lumbar',
+  'thorax',
+  'ribR',
+  'ribL',
+  'neck',
+  'head',
+  'humerusR',
+  'forearmR',
+  'handR',
+  'humerusL',
+  'forearmL',
+  'handL',
+];
+
+const LOWER_BALANCE_SEGMENTS: readonly JointId[] = [
+  'pelvis',
+  'hipR',
+  'femurR',
+  'shinR',
+  'footR',
+  'hipL',
+  'femurL',
+  'shinL',
+  'footL',
+];
+
+function getWeightedSegmentCenter(
+  computed: Record<JointId, ComputedJoint>,
+  jointIds: readonly JointId[]
+): { center: Point2D; mass: number } {
+  let mass = 0;
+  let x = 0;
+  let y = 0;
+
+  for (const id of jointIds) {
+    const joint = computed[id];
+    const segmentMass =
+      Math.max(0, joint.effectiveLengthPx) * Math.max(0.1, joint.effectiveWidthScale);
+    if (segmentMass <= 0) continue;
+
+    mass += segmentMass;
+    x += ((joint.x + joint.endX) / 2) * segmentMass;
+    y += ((joint.y + joint.endY) / 2) * segmentMass;
+  }
+
+  return {
+    center: mass > 0 ? { x: x / mass, y: y / mass } : { x: 0, y: 0 },
+    mass,
+  };
+}
+
+export function computeBodyBalanceCenters(
+  computed: Record<JointId, ComputedJoint>
+): BodyBalanceCenters {
+  const upper = getWeightedSegmentCenter(computed, UPPER_BALANCE_SEGMENTS);
+  const lower = getWeightedSegmentCenter(computed, LOWER_BALANCE_SEGMENTS);
+  const totalMass = upper.mass + lower.mass;
+  return {
+    upper: upper.center,
+    lower: lower.center,
+    whole:
+      totalMass > 0
+        ? {
+            x: (upper.center.x * upper.mass + lower.center.x * lower.mass) / totalMass,
+            y: (upper.center.y * upper.mass + lower.center.y * lower.mass) / totalMass,
+          }
+        : { x: 0, y: 0 },
+    upperMass: upper.mass,
+    lowerMass: lower.mass,
+  };
 }
 
 export function solveTwoBoneIK(
@@ -1376,6 +1570,223 @@ export function solveSpineCCDIK(
   return current;
 }
 
+const FACEPLATE_LOOK_CHAIN = [
+  { id: 'head', weight: 0.42, maxDelta: 30 },
+  { id: 'neck', weight: 0.28, maxDelta: 22 },
+  { id: 'thorax', weight: 0.18, maxDelta: 15 },
+  { id: 'lumbar', weight: 0.12, maxDelta: 10 },
+] as const satisfies readonly { id: JointId; weight: number; maxDelta: number }[];
+
+const FACEPLATE_SUPPORT_JOINTS = [
+  { id: 'braceR', weight: 0.015, maxDelta: 2 },
+  { id: 'braceL', weight: 0.015, maxDelta: 2 },
+  { id: 'clavOuterR', weight: 0.015, maxDelta: 2 },
+  { id: 'clavOuterL', weight: 0.015, maxDelta: 2 },
+  { id: 'humerusR', weight: 0.01, maxDelta: 2 },
+  { id: 'humerusL', weight: 0.01, maxDelta: 2 },
+  { id: 'hipR', weight: 0.01, maxDelta: 1.5 },
+  { id: 'hipL', weight: 0.01, maxDelta: 1.5 },
+] as const satisfies readonly { id: JointId; weight: number; maxDelta: number }[];
+
+export type FaceplateLookCollarHold = Partial<
+  Record<'braceR' | 'braceL' | 'clavOuterR' | 'clavOuterL', number>
+>;
+
+function stabilizeLookCollars(
+  baseline: ArmatureState,
+  solved: ArmatureState,
+  hold?: FaceplateLookCollarHold
+): ArmatureState {
+  if (!hold) return solved;
+  let current = solved;
+  for (const id of ['braceR', 'braceL', 'clavOuterR', 'clavOuterL'] as const) {
+    const heldAngle = hold[id];
+    const runtime = current.joints[id];
+    if (
+      heldAngle === undefined ||
+      runtime.mode === 'PIN' ||
+      runtime.physicsMode === 'rigid'
+    ) {
+      continue;
+    }
+
+    const baselineAngle = baseline.joints[id].localAngle;
+    const heldDelta = shortestAngleDelta(baselineAngle, heldAngle);
+    const candidateDelta = shortestAngleDelta(baselineAngle, runtime.localAngle);
+    const retreating =
+      heldDelta * candidateDelta >= 0 && Math.abs(candidateDelta) < Math.abs(heldDelta);
+    const difference = shortestAngleDelta(heldAngle, runtime.localAngle);
+    const response = retreating
+      ? 0.16 + 0.16 * Math.tanh(Math.abs(difference) / 8)
+      : 0.52 + 0.38 * Math.tanh(Math.abs(difference) / 8);
+    let localAngle = heldAngle + difference * response;
+
+    const [minAngle, maxAngle] = JOINT_SPEC_MAP[id].limits ?? [-180, 180];
+    localAngle = Math.max(minAngle, Math.min(maxAngle, localAngle));
+    current = {
+      ...current,
+      joints: {
+        ...current.joints,
+        [id]: { ...runtime, localAngle },
+      },
+    };
+  }
+  return current;
+}
+
+export function setFaceplateOffset(
+  state: ArmatureState,
+  offsetX: number,
+  offsetY: number
+): ArmatureState {
+  return {
+    ...state,
+    faceplateOffsetX: Math.max(-FACEPLATE_SLIDE_LIMIT_SVG, Math.min(FACEPLATE_SLIDE_LIMIT_SVG, offsetX)),
+    faceplateOffsetY: Math.max(-FACEPLATE_SLIDE_LIMIT_SVG, Math.min(FACEPLATE_SLIDE_LIMIT_SVG, offsetY)),
+  };
+}
+
+export function solveFaceplateLookIK(
+  state: ArmatureState,
+  targetX: number,
+  targetY: number,
+  canvasOrigin: Point2D = { x: PAPER_WIDTH / 2, y: PAPER_HEIGHT / 2 },
+  collarHold?: FaceplateLookCollarHold
+): ArmatureState {
+  const initial = computeArmature(state, canvasOrigin);
+  const initialFaceplate = initial.lip;
+  const headMatrix = initial.head.boneMatrix;
+  const determinant = headMatrix[0] * headMatrix[3] - headMatrix[1] * headMatrix[2];
+  const worldDeltaX = targetX - initialFaceplate.x;
+  const worldDeltaY = targetY - initialFaceplate.y;
+  const localDeltaX =
+    Math.abs(determinant) > 1e-8
+      ? (headMatrix[3] * worldDeltaX - headMatrix[2] * worldDeltaY) / determinant
+      : 0;
+  const localDeltaY =
+    Math.abs(determinant) > 1e-8
+      ? (-headMatrix[1] * worldDeltaX + headMatrix[0] * worldDeltaY) / determinant
+      : 0;
+  const scaleFactor = SVG_MODEL_CONSTANTS.puppytScaleFactor;
+  let current = setFaceplateOffset(
+    state,
+    (state.faceplateOffsetX ?? 0) + localDeltaX / scaleFactor,
+    (state.faceplateOffsetY ?? 0) + localDeltaY / scaleFactor
+  );
+  const slidFaceplate = computeArmature(current, canvasOrigin).lip;
+  const thoraxMatrix = initial.thorax.boneMatrix;
+  const thoraxDeterminant =
+    thoraxMatrix[0] * thoraxMatrix[3] - thoraxMatrix[1] * thoraxMatrix[2];
+  const remainingX = targetX - slidFaceplate.x;
+  const remainingY = targetY - slidFaceplate.y;
+  const remainingLocalY =
+    Math.abs(thoraxDeterminant) > 1e-8
+      ? (-thoraxMatrix[1] * remainingX + thoraxMatrix[0] * remainingY) / thoraxDeterminant
+      : 0;
+  const neckSpec = JOINT_SPEC_MAP.neck;
+  const neckLengthSvg = neckSpec.restTip
+    ? Math.hypot(
+        neckSpec.restTip[0] - neckSpec.restPivot[0],
+        neckSpec.restTip[1] - neckSpec.restPivot[1]
+      ) / scaleFactor
+    : 0;
+  current = {
+    ...current,
+    neckLift: Math.max(
+      0,
+      Math.min(
+        neckLengthSvg / 2,
+        (state.neckLift ?? 0) - (remainingLocalY / scaleFactor) * 0.35
+      )
+    ),
+  };
+  current = setJointMode(current, 'lip', 'IK');
+
+  for (let iteration = 0; iteration < 12; iteration++) {
+    for (const { id, weight, maxDelta } of FACEPLATE_LOOK_CHAIN) {
+      const runtime = current.joints[id];
+      const baseline = state.joints[id];
+      if (runtime.mode === 'PIN' || runtime.physicsMode === 'rigid') continue;
+
+      const computed = computeArmature(current, canvasOrigin);
+      const pivot = computed[id];
+      const faceplate = computed.lip;
+      const currentAngle =
+        (Math.atan2(faceplate.y - pivot.y, faceplate.x - pivot.x) * 180) / Math.PI;
+      const targetAngle = (Math.atan2(targetY - pivot.y, targetX - pivot.x) * 180) / Math.PI;
+      const delta = shortestAngleDelta(currentAngle, targetAngle);
+      const step = Math.max(
+        -7,
+        Math.min(7, delta * weight * getPhysicsMultiplier(runtime))
+      );
+      if (Math.abs(step) < 0.02) continue;
+
+      const specLimits = JOINT_SPEC_MAP[id]?.limits ?? [-180, 180];
+      const minAngle = Math.max(specLimits[0], baseline.localAngle - maxDelta);
+      const maxAngle = Math.min(specLimits[1], baseline.localAngle + maxDelta);
+      if (minAngle > maxAngle) continue;
+
+      const localAngle = Math.max(
+        minAngle,
+        Math.min(
+          maxAngle,
+          applyJointAngleConstraint(runtime.localAngle + step, current.continuousSpin)
+        )
+      );
+      current = {
+        ...current,
+        joints: {
+          ...current.joints,
+          [id]: { ...runtime, localAngle },
+        },
+      };
+    }
+
+    const faceplate = computeArmature(current, canvasOrigin).lip;
+    if (Math.hypot(targetX - faceplate.x, targetY - faceplate.y) < 1.5) break;
+  }
+
+  const spineMotion = FACEPLATE_LOOK_CHAIN.reduce(
+    (total, { id }) =>
+      total + Math.abs(shortestAngleDelta(state.joints[id].localAngle, current.joints[id].localAngle)),
+    0
+  );
+  const signedMotion = FACEPLATE_LOOK_CHAIN.reduce(
+    (total, { id, weight }) =>
+      total + shortestAngleDelta(state.joints[id].localAngle, current.joints[id].localAngle) * weight,
+    0
+  );
+  if (spineMotion < 1e-4 || Math.abs(signedMotion) < 1e-4) {
+    return stabilizeLookCollars(state, current, collarHold);
+  }
+
+  const supportDirection = Math.sign(signedMotion);
+  for (const { id, weight, maxDelta } of FACEPLATE_SUPPORT_JOINTS) {
+    const runtime = current.joints[id];
+    const baseline = state.joints[id];
+    if (runtime.mode === 'PIN' || runtime.physicsMode === 'rigid') continue;
+
+    const specLimits = JOINT_SPEC_MAP[id]?.limits ?? [-180, 180];
+    const response = Math.max(
+      -maxDelta,
+      Math.min(maxDelta, supportDirection * spineMotion * weight * getPhysicsMultiplier(runtime))
+    );
+    const localAngle = Math.max(
+      specLimits[0],
+      Math.min(specLimits[1], baseline.localAngle + response)
+    );
+    current = {
+      ...current,
+      joints: {
+        ...current.joints,
+        [id]: { ...runtime, localAngle },
+      },
+    };
+  }
+
+  return stabilizeLookCollars(state, current, collarHold);
+}
+
 export function solveDigitIK(
   state: ArmatureState,
   tipId: JointId,
@@ -1485,6 +1896,93 @@ export function solveJointIK(
 
   // Fallback to aim rotation
   return solveBoneAimRotation(state, jointId, targetX, targetY, canvasOrigin);
+}
+
+export interface PressurePlateSolution {
+  armature: ArmatureState;
+  pressurePlateY: number;
+  atHardStop: boolean;
+}
+
+export function solvePressurePlateContact(
+  state: ArmatureState,
+  targetY: number,
+  canvasOrigin: Point2D = { x: PAPER_WIDTH / 2, y: PAPER_HEIGHT / 2 }
+): PressurePlateSolution {
+  const solveAtY = (y: number) => {
+    let next = state;
+    for (const side of ['R', 'L'] as const) {
+      const footId: JointId = `foot${side}`;
+      const toeId: JointId = `toe${side}`;
+      const computed = computeArmature(next, canvasOrigin);
+      const foot = computed[footId];
+      const toe = computed[toeId];
+      const length = Math.hypot(toe.x - foot.x, toe.y - foot.y);
+      if (length < 1e-4) continue;
+
+      const specLimits = JOINT_SPEC_MAP[footId]?.limits ?? [-180, 180];
+      const baseWorldDeg = foot.worldAngle - foot.localAngle;
+      const sinTarget = Math.max(-1, Math.min(1, (y - foot.y) / length));
+      const angleA = Math.asin(sinTarget) * RAD_TO_DEG;
+      const worldCandidates = [angleA, 180 - angleA];
+      let bestLocalAngle = foot.localAngle;
+      let bestError = Number.POSITIVE_INFINITY;
+      let bestMotion = Number.POSITIVE_INFINITY;
+
+      for (const worldAngle of worldCandidates) {
+        const rawLocalAngle =
+          foot.localAngle + shortestAngleDelta(foot.worldAngle, worldAngle);
+        const localAngle = Math.max(
+          specLimits[0],
+          Math.min(specLimits[1], rawLocalAngle)
+        );
+        const achievedY =
+          foot.y + length * Math.sin((baseWorldDeg + localAngle) * DEG_TO_RAD);
+        const error = Math.abs(achievedY - y);
+        const motion = Math.abs(localAngle - foot.localAngle);
+        if (error < bestError || (Math.abs(error - bestError) < 1e-4 && motion < bestMotion)) {
+          bestLocalAngle = localAngle;
+          bestError = error;
+          bestMotion = motion;
+        }
+      }
+
+      next = {
+        ...next,
+        joints: {
+          ...next.joints,
+          [footId]: {
+            ...next.joints[footId],
+            localAngle: applyJointAngleConstraint(bestLocalAngle, next.continuousSpin),
+          },
+        },
+      };
+    }
+    return next;
+  };
+
+  const first = solveAtY(targetY);
+  const firstJoints = computeArmature(first, canvasOrigin);
+  const rightError = Math.abs(firstJoints.toeR.y - targetY);
+  const leftError = Math.abs(firstJoints.toeL.y - targetY);
+  if (Math.max(rightError, leftError) <= 1.5) {
+    return { armature: first, pressurePlateY: targetY, atHardStop: false };
+  }
+
+  const initial = computeArmature(state, canvasOrigin);
+  const movingDown = targetY >= (initial.toeR.y + initial.toeL.y) / 2;
+  const hardStopY = movingDown
+    ? Math.min(firstJoints.toeR.y, firstJoints.toeL.y)
+    : Math.max(firstJoints.toeR.y, firstJoints.toeL.y);
+  const pressurePlateY = movingDown
+    ? Math.min(targetY, hardStopY)
+    : Math.max(targetY, hardStopY);
+
+  return {
+    armature: solveAtY(pressurePlateY),
+    pressurePlateY,
+    atHardStop: true,
+  };
 }
 
 /**
@@ -1687,27 +2185,37 @@ export function setCollarToggleState(
  * Strictly clamps waist motion inside the intersection of both leg reach envelopes so
  * cardboard-cutout legs and hips NEVER stretch or detach from their sockets.
  */
+type WaistBalanceOptions = {
+  baseRootRotation?: number;
+  baseLumbarAngle?: number;
+  baseThoraxAngle?: number;
+  baseNeckAngle?: number;
+  startPelvisX?: number;
+  startPelvisY?: number;
+  torsoCompensation?: number;
+};
+
 export function solveWaistBalanceHula(
   state: ArmatureState,
   targetPelvisX: number,
   targetPelvisY: number,
-  footRPin: Point2D & { worldAngle?: number },
-  footLPin: Point2D & { worldAngle?: number },
+  footRPin: GroundContactPin,
+  footLPin: GroundContactPin,
   canvasOrigin: Point2D = { x: PAPER_WIDTH / 2, y: PAPER_HEIGHT / 2 },
-  options?: {
-    baseRootRotation?: number;
-    baseLumbarAngle?: number;
-    startPelvisX?: number;
-  }
+  options?: WaistBalanceOptions
 ): ArmatureState {
   const baseline = computeArmature(state, canvasOrigin);
+  const rightContactId = footRPin.jointId === 'toeR' ? 'toeR' : 'footR';
+  const leftContactId = footLPin.jointId === 'toeL' ? 'toeL' : 'footL';
+  const rightEndpoint = baseline[rightContactId];
+  const leftEndpoint = baseline[leftContactId];
   const L1_R = Math.max(
     1,
     Math.hypot(baseline.shinR.x - baseline.femurR.x, baseline.shinR.y - baseline.femurR.y)
   );
   const L2_R = Math.max(
     1,
-    Math.hypot(baseline.footR.x - baseline.shinR.x, baseline.footR.y - baseline.shinR.y)
+    Math.hypot(rightEndpoint.x - baseline.shinR.x, rightEndpoint.y - baseline.shinR.y)
   );
   const L1_L = Math.max(
     1,
@@ -1715,7 +2223,7 @@ export function solveWaistBalanceHula(
   );
   const L2_L = Math.max(
     1,
-    Math.hypot(baseline.footL.x - baseline.shinL.x, baseline.footL.y - baseline.shinL.y)
+    Math.hypot(leftEndpoint.x - baseline.shinL.x, leftEndpoint.y - baseline.shinL.y)
   );
 
   const maxReachR = (L1_R + L2_R) * 0.992;
@@ -1725,14 +2233,44 @@ export function solveWaistBalanceHula(
 
   const baseRootRot = options?.baseRootRotation ?? state.rootRotation;
   const baseLumbar = options?.baseLumbarAngle ?? state.joints.lumbar.localAngle;
-  const refX = options?.startPelvisX ?? (footRPin.x + footLPin.x) * 0.5;
+  const baseThorax = options?.baseThoraxAngle ?? state.joints.thorax.localAngle;
+  const baseNeck = options?.baseNeckAngle ?? state.joints.neck.localAngle;
+  const refX = options?.startPelvisX ?? baseline.pelvis.x;
+  const refY = options?.startPelvisY ?? baseline.pelvis.y;
+  const compensationStrength = options?.torsoCompensation ?? 1;
+  const rightSupportWeight = Math.max(0, footRPin.supportWeight ?? 1);
+  const leftSupportWeight = Math.max(0, footLPin.supportWeight ?? 1);
+  const supportWeightTotal = rightSupportWeight + leftSupportWeight;
+  const hasGroundSupport = supportWeightTotal > 1e-4;
+  const rightGeometryWeight = hasGroundSupport ? rightSupportWeight : 1;
+  const leftGeometryWeight = hasGroundSupport ? leftSupportWeight : 1;
+  const geometryWeightTotal = rightGeometryWeight + leftGeometryWeight;
+  const supportCenterX =
+    (footRPin.x * rightGeometryWeight + footLPin.x * leftGeometryWeight) /
+    geometryWeightTotal;
+  const supportCenterY =
+    (footRPin.y * rightGeometryWeight + footLPin.y * leftGeometryWeight) /
+    geometryWeightTotal;
 
   // Natural hula hip tilt proportional to lateral sway + balancing torso counter-lean
-  const rawLateral = targetPelvisX - refX;
-  const hulaTilt = Math.max(-10, Math.min(10, rawLateral * 0.075));
+  const rawLateral =
+    targetPelvisX - refX + (supportCenterX - baseline.pelvis.x) * 0.12;
+  const hulaTilt = softSaturate(rawLateral * 0.075, 10);
   const nextRootRot = applyJointAngleConstraint(baseRootRot + hulaTilt, state.continuousSpin);
+  const verticalLean = softSaturate(
+    (targetPelvisY - refY) * 0.055 * compensationStrength,
+    14
+  );
   const nextLumbarAngle = applyJointAngleConstraint(
-    Math.max(-45, Math.min(45, baseLumbar - hulaTilt * 0.85)),
+    Math.max(-45, Math.min(45, baseLumbar - hulaTilt * 0.85 - verticalLean * 0.22)),
+    state.continuousSpin
+  );
+  const nextThoraxAngle = applyJointAngleConstraint(
+    Math.max(-55, Math.min(55, baseThorax + hulaTilt * 0.3 + verticalLean * 0.65)),
+    state.continuousSpin
+  );
+  const nextNeckAngle = applyJointAngleConstraint(
+    Math.max(-55, Math.min(55, baseNeck + hulaTilt * 0.12 - verticalLean * 0.35)),
     state.continuousSpin
   );
 
@@ -1758,7 +2296,7 @@ export function solveWaistBalanceHula(
 
   // Project candidate waist position into the intersection of both rigid leg reach circles
   let px = targetPelvisX;
-  let py = Math.min(targetPelvisY, Math.min(footRPin.y, footLPin.y) - 52);
+  let py = Math.min(targetPelvisY, supportCenterY - 52);
 
   for (let pass = 0; pass < 5; pass++) {
     const dxR = px - centerR.x;
@@ -1783,7 +2321,7 @@ export function solveWaistBalanceHula(
       py = centerL.y + (dyL / dL) * minReachL;
     }
 
-    py = Math.min(py, Math.min(footRPin.y, footLPin.y) - 52);
+    py = Math.min(py, supportCenterY - 52);
   }
 
   let next: ArmatureState = {
@@ -1798,16 +2336,76 @@ export function solveWaistBalanceHula(
         ...state.joints.lumbar,
         localAngle: nextLumbarAngle,
       },
+      thorax: {
+        ...state.joints.thorax,
+        localAngle: nextThoraxAngle,
+      },
+      neck: {
+        ...state.joints.neck,
+        localAngle: nextNeckAngle,
+      },
     },
   };
 
+  if (hasGroundSupport) {
+    for (let pass = 0; pass < 2; pass++) {
+      const centers = computeBodyBalanceCenters(computeArmature(next, canvasOrigin));
+      const upperMassShare =
+        centers.upperMass / Math.max(1e-4, centers.upperMass + centers.lowerMass);
+      const upperLowerOffsetX = centers.upper.x - centers.lower.x;
+      const balanceErrorX = centers.whole.x - supportCenterX;
+      const balanceTilt = softSaturate(
+        balanceErrorX * 0.035 * upperMassShare + upperLowerOffsetX * 0.012,
+        8
+      );
+      if (Math.abs(balanceTilt) < 0.02) break;
+
+      const clampSpineAngle = (id: JointId, angle: number) => {
+        const limits = JOINT_SPEC_MAP[id]?.limits ?? [-180, 180];
+        return Math.max(
+          limits[0],
+          Math.min(limits[1], applyJointAngleConstraint(angle, next.continuousSpin))
+        );
+      };
+      next = {
+        ...next,
+        joints: {
+          ...next.joints,
+          lumbar: {
+            ...next.joints.lumbar,
+            localAngle: clampSpineAngle(
+              'lumbar',
+              next.joints.lumbar.localAngle - balanceTilt * 0.65
+            ),
+          },
+          thorax: {
+            ...next.joints.thorax,
+            localAngle: clampSpineAngle(
+              'thorax',
+              next.joints.thorax.localAngle - balanceTilt * 0.25
+            ),
+          },
+          neck: {
+            ...next.joints.neck,
+            localAngle: clampSpineAngle(
+              'neck',
+              next.joints.neck.localAngle - balanceTilt * 0.1
+            ),
+          },
+        },
+      };
+    }
+  }
+
   // Solve both legs analytically with softDamp disabled so feet stay dead-locked to ground pins
   for (let iter = 0; iter < 2; iter++) {
-    next = solveTwoBoneIK(next, 'footR', footRPin.x, footRPin.y, canvasOrigin, {
+    next = solveJointIK(next, rightContactId, footRPin.x, footRPin.y, canvasOrigin, {
+      solver: 'analytical',
       softDamp: false,
       constrainLimits: false,
     });
-    next = solveTwoBoneIK(next, 'footL', footLPin.x, footLPin.y, canvasOrigin, {
+    next = solveJointIK(next, leftContactId, footLPin.x, footLPin.y, canvasOrigin, {
+      solver: 'analytical',
       softDamp: false,
       constrainLimits: false,
     });
@@ -1815,7 +2413,7 @@ export function solveWaistBalanceHula(
 
   // Keep feet flat at their planted world angles on the ground
   const afterLegs = computeArmature(next, canvasOrigin);
-  if (footRPin.worldAngle !== undefined) {
+  if (rightContactId === 'footR' && footRPin.worldAngle !== undefined) {
     const deltaFootR = shortestAngleDelta(afterLegs.footR.worldAngle, footRPin.worldAngle);
     next = {
       ...next,
@@ -1831,7 +2429,7 @@ export function solveWaistBalanceHula(
       },
     };
   }
-  if (footLPin.worldAngle !== undefined) {
+  if (leftContactId === 'footL' && footLPin.worldAngle !== undefined) {
     const deltaFootL = shortestAngleDelta(afterLegs.footL.worldAngle, footLPin.worldAngle);
     next = {
       ...next,
@@ -1846,6 +2444,127 @@ export function solveWaistBalanceHula(
         },
       },
     };
+  }
+
+  const refineContactPin = (
+    contactId: JointId,
+    rootId: JointId,
+    midId: JointId,
+    pin: GroundContactPin
+  ) => {
+    let refined = next;
+    for (let iteration = 0; iteration < 3; iteration++) {
+      const current = computeArmature(refined, canvasOrigin)[contactId];
+      const errorX = pin.x - current.x;
+      const errorY = pin.y - current.y;
+      if (Math.hypot(errorX, errorY) < 0.05) break;
+
+      const epsilon = 0.1;
+      const rootProbe = {
+        ...refined,
+        joints: {
+          ...refined.joints,
+          [rootId]: {
+            ...refined.joints[rootId],
+            localAngle: refined.joints[rootId].localAngle + epsilon,
+          },
+        },
+      };
+      const midProbe = {
+        ...refined,
+        joints: {
+          ...refined.joints,
+          [midId]: {
+            ...refined.joints[midId],
+            localAngle: refined.joints[midId].localAngle + epsilon,
+          },
+        },
+      };
+      const rootPoint = computeArmature(rootProbe, canvasOrigin)[contactId];
+      const midPoint = computeArmature(midProbe, canvasOrigin)[contactId];
+      const j11 = (rootPoint.x - current.x) / epsilon;
+      const j21 = (rootPoint.y - current.y) / epsilon;
+      const j12 = (midPoint.x - current.x) / epsilon;
+      const j22 = (midPoint.y - current.y) / epsilon;
+      const determinant = j11 * j22 - j12 * j21;
+      if (Math.abs(determinant) < 1e-5) break;
+
+      const rootDelta = Math.max(
+        -4,
+        Math.min(4, (errorX * j22 - errorY * j12) / determinant)
+      );
+      const midDelta = Math.max(
+        -4,
+        Math.min(4, (j11 * errorY - j21 * errorX) / determinant)
+      );
+      const candidate = {
+        ...refined,
+        joints: {
+          ...refined.joints,
+          [rootId]: {
+            ...refined.joints[rootId],
+            localAngle: refined.joints[rootId].localAngle + rootDelta,
+          },
+          [midId]: {
+            ...refined.joints[midId],
+            localAngle: refined.joints[midId].localAngle + midDelta,
+          },
+        },
+      };
+      const candidatePoint = computeArmature(candidate, canvasOrigin)[contactId];
+      if (
+        Math.hypot(pin.x - candidatePoint.x, pin.y - candidatePoint.y) >=
+        Math.hypot(errorX, errorY)
+      ) {
+        break;
+      }
+      refined = candidate;
+    }
+    return refined;
+  };
+  next = refineContactPin(rightContactId, 'femurR', 'shinR', footRPin);
+  next = refineContactPin(leftContactId, 'femurL', 'shinL', footLPin);
+
+  return next;
+}
+
+export function solveTorsoBalance(
+  state: ArmatureState,
+  targetTorsoX: number,
+  targetTorsoY: number,
+  footRPin: Point2D & { worldAngle?: number },
+  footLPin: Point2D & { worldAngle?: number },
+  canvasOrigin: Point2D = { x: PAPER_WIDTH / 2, y: PAPER_HEIGHT / 2 },
+  options?: Omit<WaistBalanceOptions, 'torsoCompensation'>
+): ArmatureState {
+  const starting = computeArmature(state, canvasOrigin);
+  const balanceOptions: WaistBalanceOptions = {
+    baseRootRotation: options?.baseRootRotation ?? state.rootRotation,
+    baseLumbarAngle: options?.baseLumbarAngle ?? state.joints.lumbar.localAngle,
+    baseThoraxAngle: options?.baseThoraxAngle ?? state.joints.thorax.localAngle,
+    baseNeckAngle: options?.baseNeckAngle ?? state.joints.neck.localAngle,
+    startPelvisX: options?.startPelvisX ?? starting.pelvis.x,
+    startPelvisY: options?.startPelvisY ?? starting.pelvis.y,
+    torsoCompensation: 1.8,
+  };
+  let next = state;
+
+  for (let pass = 0; pass < 4; pass++) {
+    const computed = computeArmature(next, canvasOrigin);
+    const torsoCenter = computeTorsoCenter(computed);
+    const errorX = targetTorsoX - torsoCenter.x;
+    const errorY = targetTorsoY - torsoCenter.y;
+    if (Math.hypot(errorX, errorY) < 0.5) break;
+
+    next = solveWaistBalanceHula(
+      next,
+      computed.pelvis.x + errorX,
+      computed.pelvis.y + errorY,
+      footRPin,
+      footLPin,
+      canvasOrigin,
+      balanceOptions
+    );
   }
 
   return next;
@@ -1885,6 +2604,11 @@ export function hasArmaturePoseDelta(a: ArmatureState, b: ArmatureState, eps = 1
     Math.abs(shortestAngleDelta(a.rootRotation, b.rootRotation)) > eps ||
     Math.abs(shortestAngleDelta(a.armSwivelR ?? 0, b.armSwivelR ?? 0)) > eps ||
     Math.abs(shortestAngleDelta(a.armSwivelL ?? 0, b.armSwivelL ?? 0)) > eps ||
+    Math.abs((a.faceplateOffsetX ?? 0) - (b.faceplateOffsetX ?? 0)) > eps ||
+    Math.abs((a.faceplateOffsetY ?? 0) - (b.faceplateOffsetY ?? 0)) > eps ||
+    Math.abs((a.neckLift ?? 0) - (b.neckLift ?? 0)) > eps ||
+    Math.abs((a.neckCollarSeparation?.x ?? 0) - (b.neckCollarSeparation?.x ?? 0)) > eps ||
+    Math.abs((a.neckCollarSeparation?.y ?? 0) - (b.neckCollarSeparation?.y ?? 0)) > eps ||
     (a.hipToggleSign ?? 1) !== (b.hipToggleSign ?? 1) ||
     a.isAnchorPinned !== b.isAnchorPinned ||
     a.environmentalAnchor !== b.environmentalAnchor ||
@@ -1934,7 +2658,7 @@ export function interpolateArmatures(
     };
   }
 
-  // Smoothly extend hip bridge toward 180° at t=0.5 when switching hip toggle sign (A <-> V)
+  // Smoothly extend the hip bridge toward its 180° apex when switching toggle signs.
   const hipSignA = a.hipToggleSign ?? 1;
   const hipSignB = b.hipToggleSign ?? 1;
   if (hipSignA !== hipSignB && nextJoints.hipR && nextJoints.hipL) {
@@ -1964,6 +2688,21 @@ export function interpolateArmatures(
     hipToggleSign: easedT < 0.5 ? hipSignA : hipSignB,
     armSwivelR: normalizeAngleDeg(swivelRA + shortestAngleDelta(swivelRA, swivelRB) * easedT),
     armSwivelL: normalizeAngleDeg(swivelLA + shortestAngleDelta(swivelLA, swivelLB) * easedT),
+    faceplateOffsetX:
+      (a.faceplateOffsetX ?? 0) +
+      ((b.faceplateOffsetX ?? 0) - (a.faceplateOffsetX ?? 0)) * easedT,
+    faceplateOffsetY:
+      (a.faceplateOffsetY ?? 0) +
+      ((b.faceplateOffsetY ?? 0) - (a.faceplateOffsetY ?? 0)) * easedT,
+    neckLift: (a.neckLift ?? 0) + ((b.neckLift ?? 0) - (a.neckLift ?? 0)) * easedT,
+    neckCollarSeparation: {
+      x:
+        (a.neckCollarSeparation?.x ?? 0) +
+        ((b.neckCollarSeparation?.x ?? 0) - (a.neckCollarSeparation?.x ?? 0)) * easedT,
+      y:
+        (a.neckCollarSeparation?.y ?? 0) +
+        ((b.neckCollarSeparation?.y ?? 0) - (a.neckCollarSeparation?.y ?? 0)) * easedT,
+    },
     isAnchorPinned: a.isAnchorPinned && b.isAnchorPinned,
     joints: nextJoints,
   };
@@ -2097,6 +2836,13 @@ export function mirrorPose(state: ArmatureState): ArmatureState {
     rootRotation: applyJointAngleConstraint(-state.rootRotation, state.continuousSpin),
     armSwivelR: state.armSwivelL ?? 0,
     armSwivelL: state.armSwivelR ?? 0,
+    faceplateOffsetX: -(state.faceplateOffsetX ?? 0),
+    faceplateOffsetY: state.faceplateOffsetY ?? 0,
+    neckLift: state.neckLift ?? 0,
+    neckCollarSeparation: {
+      x: -(state.neckCollarSeparation?.x ?? 0),
+      y: state.neckCollarSeparation?.y ?? 0,
+    },
     joints: nextJoints,
   };
 }
@@ -2113,6 +2859,50 @@ export function setJointMode(
       [jointId]: { ...state.joints[jointId], mode },
     },
   };
+}
+
+export function setBalancedSpineLean(
+  state: ArmatureState,
+  jointId: 'lumbar' | 'thorax' | 'neck',
+  localAngle: number
+): ArmatureState {
+  const spineIds = ['lumbar', 'thorax', 'neck'] as const;
+  const toSliderAngle = (angle: number) =>
+    Math.round(Math.max(-55, Math.min(55, angle)) * 2) / 2;
+  const nextAngle = toSliderAngle(localAngle);
+  const joints = { ...state.joints };
+  const otherIds = spineIds.filter((id) => id !== jointId);
+
+  for (const id of spineIds) {
+    joints[id] = { ...state.joints[id], localAngle: toSliderAngle(state.joints[id].localAngle) };
+  }
+  const delta = nextAngle - joints[jointId].localAngle;
+  joints[jointId] = { ...state.joints[jointId], localAngle: nextAngle };
+  let remainingTicks = Math.round(-delta * 2);
+  let adjustableIds = otherIds;
+  for (
+    let iteration = 0;
+    iteration < otherIds.length && adjustableIds.length > 0 && remainingTicks !== 0;
+    iteration++
+  ) {
+    const ticksPerJoint = Math.trunc(remainingTicks / adjustableIds.length);
+    let remainderTicks = remainingTicks - ticksPerJoint * adjustableIds.length;
+    const nextAdjustableIds: Array<(typeof otherIds)[number]> = [];
+    for (const id of adjustableIds) {
+      const runtime = joints[id];
+      const extraTick = remainderTicks > 0 ? 1 : remainderTicks < 0 ? -1 : 0;
+      remainderTicks -= extraTick;
+      const angle = toSliderAngle(
+        runtime.localAngle + (ticksPerJoint + extraTick) / 2
+      );
+      remainingTicks -= Math.round((angle - runtime.localAngle) * 2);
+      joints[id] = { ...runtime, localAngle: angle };
+      if (angle > -55 && angle < 55) nextAdjustableIds.push(id);
+    }
+    adjustableIds = nextAdjustableIds;
+  }
+
+  return { ...state, joints };
 }
 
 // ============================================================================

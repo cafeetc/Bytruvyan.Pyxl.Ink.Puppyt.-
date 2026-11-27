@@ -7,6 +7,7 @@ import {
   advanceSequencePlayback,
   buildStageSvgTransform,
   cloneSceneForNewShot,
+  createShotBridgeSlots,
   computeMediaPlateBox,
   createDefaultScene,
   createSamplePlateMedia,
@@ -103,4 +104,23 @@ test('video timeline sync quantizes cleanly to cutout FPS and sequence playback 
   const nextShot = advanceSequencePlayback([s1, s2], s1.id, 0.95, 0.4, 1, 'sequence');
   assert.equal(nextShot.nextSceneId, s2.id);
   assert.ok(nextShot.nextT >= 0 && nextShot.nextT < 0.2);
+});
+
+test('shot bridge keyframes preserve endpoint poses and use model interpolation for the midpoint', () => {
+  const previousEnd = createDefaultScene(0).armature;
+  previousEnd.rootX = 100;
+  previousEnd.joints.neck.localAngle = -20;
+  previousEnd.neckCollarSeparation = { x: 4, y: 2 };
+
+  const nextStart = createDefaultScene(1).armature;
+  nextStart.rootX = 200;
+  nextStart.joints.neck.localAngle = 20;
+  nextStart.neckCollarSeparation = { x: 24, y: 12 };
+
+  const slots = createShotBridgeSlots(previousEnd, nextStart, 'mechanical');
+  assert.deepEqual(slots.A, previousEnd);
+  assert.deepEqual(slots.C, nextStart);
+  assert.equal(slots.B?.rootX, 150);
+  assert.equal(slots.B?.joints.neck.localAngle, 0);
+  assert.deepEqual(slots.B?.neckCollarSeparation, { x: 14, y: 7 });
 });

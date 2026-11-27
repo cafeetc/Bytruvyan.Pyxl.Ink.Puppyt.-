@@ -1,7 +1,13 @@
 {
   "recommendations": [
     "dbaeumer.vscode-eslint",
+    "yoavbls.pretty-ts-errors",
+    "usernamehw.errorlens",
     "bradlc.vscode-tailwindcss",
-    "esbenp.prettier-vscode"
+    "esbenp.prettier-vscode",
+    "jock.svg",
+    "naumovs.color-highlight",
+    "eamodio.gitlens",
+    "AykutSarac.jsoncrack-vscode"
   ]
 }

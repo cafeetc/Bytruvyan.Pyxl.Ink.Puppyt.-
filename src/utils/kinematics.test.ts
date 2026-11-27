@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   COLLAR_LINK_SCALE,
+  FACEPLATE_SLIDE_LIMIT_SVG,
   JOINT_SPECS,
   REPO_GREEN_GLOW_DARK,
   REPO_GREEN_GLOW_LIGHT,
@@ -25,6 +26,8 @@ import {
   HIP_BRIDGE_LINK_STAGE_PX,
   HIP_BRIDGE_LINK_SVG,
   applyAffine,
+  computeBodyBalanceCenters,
+  computeTorsoCenter,
   applyCollarSwivelDragInput,
   auditRigHierarchy,
   buildCaveArtGeometry,
@@ -40,6 +43,7 @@ import {
   setArmReverseSwivel,
   setCollarToggleState,
   setHipToggleState,
+  setNeckCollarSeparation,
   shortestAngleDelta,
   solveBoneAimRotation,
   solveCollarToggleFromTarget,
@@ -48,6 +52,11 @@ import {
   solveTwoBoneIK,
   solveSingleBoneAimIK,
   solveJointIK,
+  solveFaceplateLookIK,
+  solvePressurePlateContact,
+  solveTorsoBalance,
+  setBalancedSpineLean,
+  setFaceplateOffset,
   solveWaistBalanceHula,
   interpolateArmatures,
   synthesizeProceduralBreakdown,
@@ -163,6 +172,183 @@ test('two-bone IK, FK bone aim rotation, mirror symmetry, and shortest-path wrap
   assert.equal(mirrored.joints.forearmL.localAngle, -afterIK.joints.forearmR.localAngle);
 });
 
+test('faceplate look IK tracks the cursor with constrained spine motion and subtle body support', () => {
+  const state = createPosePreset('tpose');
+  const origin = { x: 681.5, y: 900 };
+  const before = computeArmature(state, origin);
+  const target = { x: before.lip.x + 120, y: before.lip.y + 45 };
+  const result = solveFaceplateLookIK(state, target.x, target.y, origin);
+  const after = computeArmature(result, origin);
+
+  const startDistance = Math.hypot(before.lip.x - target.x, before.lip.y - target.y);
+  const endDistance = Math.hypot(after.lip.x - target.x, after.lip.y - target.y);
+  assert.ok(endDistance < startDistance, `faceplate moved closer (${startDistance} -> ${endDistance})`);
+  assert.equal(result.joints.lip.mode, 'IK');
+
+  const spineLimits = { head: 30, neck: 22, thorax: 15, lumbar: 10 } as const;
+  const spineIds = Object.keys(spineLimits) as Array<keyof typeof spineLimits>;
+  const spineMotion = spineIds.reduce((total, id) => {
+    const delta = Math.abs(result.joints[id].localAngle - state.joints[id].localAngle);
+    assert.ok(delta <= spineLimits[id] + 1e-4, `${id} stayed within its look range`);
+    return total + delta;
+  }, 0);
+  const supportIds = [
+    'braceR',
+    'braceL',
+    'clavOuterR',
+    'clavOuterL',
+    'humerusR',
+    'humerusL',
+    'hipR',
+    'hipL',
+  ] as const;
+  const supportMotion = supportIds.reduce(
+    (total, id) => total + Math.abs(result.joints[id].localAngle - state.joints[id].localAngle),
+    0
+  );
+  assert.ok(spineMotion > 0, 'spine chain contributes to the look');
+  assert.ok(supportMotion > 0, 'collars, shoulders, and hips respond subtly');
+  assert.ok(supportMotion <= spineMotion * 0.101 + 1e-4, 'at least 90% of angular motion stays in the spine');
+
+  const collarIds = ['braceR', 'braceL', 'clavOuterR', 'clavOuterL'] as const;
+  const collarHold = {
+    braceR: result.joints.braceR.localAngle,
+    braceL: result.joints.braceL.localAngle,
+    clavOuterR: result.joints.clavOuterR.localAngle,
+    clavOuterL: result.joints.clavOuterL.localAngle,
+  };
+  const neutralLook = solveFaceplateLookIK(state, before.lip.x, before.lip.y, origin, collarHold);
+  const rawNeutralLook = solveFaceplateLookIK(state, before.lip.x, before.lip.y, origin);
+  const retainedNeutralMotion = collarIds.reduce(
+    (total, id) => total + Math.abs(neutralLook.joints[id].localAngle - collarHold[id]),
+    0
+  );
+  const unconstrainedNeutralMotion = collarIds.reduce(
+    (total, id) => total + Math.abs(rawNeutralLook.joints[id].localAngle - collarHold[id]),
+    0
+  );
+  assert.ok(
+    retainedNeutralMotion < unconstrainedNeutralMotion,
+    'small look changes retain more of the first collar extreme'
+  );
+  const oppositeLook = solveFaceplateLookIK(
+    state,
+    before.lip.x - 120,
+    before.lip.y - 45,
+    origin,
+    collarHold
+  );
+  assert.ok(
+    collarIds.some(
+      (id) => Math.abs(oppositeLook.joints[id].localAngle - collarHold[id]) > 0.1
+    ),
+    'collar angles release smoothly when the look direction calls for a shift'
+  );
+});
+
+test('faceplate slide is bounded, mirrored, interpolated, and neck lift preserves neck-bone length', () => {
+  const state = createPosePreset('tpose');
+  const slid = setFaceplateOffset(state, 500, -500);
+  assert.equal(slid.faceplateOffsetX, FACEPLATE_SLIDE_LIMIT_SVG);
+  assert.equal(slid.faceplateOffsetY, -FACEPLATE_SLIDE_LIMIT_SVG);
+  assert.equal(hasArmaturePoseDelta(state, slid), true);
+
+  const mirrored = mirrorPose(slid);
+  assert.equal(mirrored.faceplateOffsetX, -FACEPLATE_SLIDE_LIMIT_SVG);
+  assert.equal(mirrored.faceplateOffsetY, -FACEPLATE_SLIDE_LIMIT_SVG);
+
+  const midpoint = interpolateArmatures(state, slid, 0.5);
+  assert.equal(midpoint.faceplateOffsetX, FACEPLATE_SLIDE_LIMIT_SVG / 2);
+  assert.equal(midpoint.faceplateOffsetY, -FACEPLATE_SLIDE_LIMIT_SVG / 2);
+
+  const baseComputed = computeArmature(state);
+  const slidComputed = computeArmature(slid);
+  assert.ok(slidComputed.lip.x > baseComputed.lip.x, 'faceplate slides horizontally');
+  assert.ok(slidComputed.lip.y < baseComputed.lip.y, 'faceplate slides vertically');
+
+  const liftedComputed = computeArmature({ ...state, neckLift: 1000 });
+  assert.ok(liftedComputed.neck.y < baseComputed.neck.y, 'neck base lifts from the collar joint');
+  assert.equal(liftedComputed.thorax.y, baseComputed.thorax.y, 'collar parent remains anchored');
+  assert.ok(
+    Math.abs(
+      Math.hypot(
+        liftedComputed.neck.endX - liftedComputed.neck.x,
+        liftedComputed.neck.endY - liftedComputed.neck.y
+      ) - baseComputed.neck.effectiveLengthPx
+    ) < 1e-4,
+    'neck bone length remains unchanged'
+  );
+
+  const highTargetPose = solveFaceplateLookIK(
+    state,
+    baseComputed.lip.x,
+    baseComputed.lip.y - 180
+  );
+  assert.ok((highTargetPose.neckLift ?? 0) > 0, 'looking above the faceplate activates neck lift');
+  const reset = createPosePreset('tpose', { ...highTargetPose, faceplateOffsetX: 24, neckLift: 12 });
+  assert.equal(reset.faceplateOffsetX, 0);
+  assert.equal(reset.faceplateOffsetY, 0);
+  assert.equal(reset.neckLift, 0);
+});
+
+test('neck-collar magnet translates the connected group, clamps at neck reach, and survives pose operations', () => {
+  const state = createPosePreset('tpose');
+  const base = computeArmature(state);
+  const separated = setNeckCollarSeparation(state, { x: 1000, y: 0 });
+  const separation = separated.neckCollarSeparation!;
+  const computed = computeArmature(separated);
+
+  assert.ok(Math.hypot(separation.x, separation.y) <= base.neck.effectiveLengthPx / 2 + 1e-4);
+  assert.equal(computed.neck.neckCollarPressureRatio, 1);
+  assert.ok(Math.abs(computed.neck.x - base.neck.x - separation.x) < 1e-4);
+  assert.ok(Math.abs(computed.swivelR.x - base.swivelR.x - separation.x) < 1e-4);
+  assert.ok(Math.abs(computed.braceR.x - base.braceR.x - separation.x) < 1e-4);
+  assert.equal(hasArmaturePoseDelta(state, separated), true);
+
+  const midpoint = interpolateArmatures(state, separated, 0.5, 'mechanical');
+  assert.ok(Math.abs(midpoint.neckCollarSeparation!.x - separation.x / 2) < 1e-4);
+  assert.equal(mirrorPose(separated).neckCollarSeparation!.x, -separation.x);
+  assert.deepEqual(createPosePreset('tpose', separated).neckCollarSeparation, { x: 0, y: 0 });
+
+  const reconnected = setNeckCollarSeparation(separated, { x: 0, y: 0 });
+  assert.deepEqual(reconnected.neckCollarSeparation, { x: 0, y: 0 });
+});
+
+test('spine lean controls counter-adjust lumbar, thorax, and neck to preserve overall balance', () => {
+  const state = createPosePreset('tpose');
+  const balanced = setBalancedSpineLean(state, 'thorax', 18);
+
+  assert.equal(balanced.joints.lumbar.localAngle, -9);
+  assert.equal(balanced.joints.thorax.localAngle, 18);
+  assert.equal(balanced.joints.neck.localAngle, -9);
+  assert.equal(
+    balanced.joints.lumbar.localAngle +
+      balanced.joints.thorax.localAngle +
+      balanced.joints.neck.localAngle,
+    0
+  );
+
+  const halfStep = setBalancedSpineLean(state, 'lumbar', 0.5);
+  assert.deepEqual(
+    [halfStep.joints.lumbar, halfStep.joints.thorax, halfStep.joints.neck].map(
+      (joint) => joint.localAngle
+    ),
+    [0.5, -0.5, 0]
+  );
+
+  const limited = createPosePreset('tpose');
+  limited.joints.lumbar.localAngle = 55;
+  limited.joints.neck.localAngle = -55;
+  const rebalanced = setBalancedSpineLean(limited, 'thorax', 20);
+  assert.equal(
+    rebalanced.joints.lumbar.localAngle +
+      rebalanced.joints.thorax.localAngle +
+      rebalanced.joints.neck.localAngle,
+    0
+  );
+  assert.equal(rebalanced.joints.neck.localAngle, -55);
+});
+
 test('split two-piece collarbones fold up/down rotationally with zero stretch and half-width segments', () => {
   const rest = computeArmature(createPosePreset('tpose'));
   const fullSpanR = Math.hypot(rest.acromionR.x - rest.thorax.x, rest.acromionR.y - rest.thorax.y);
@@ -223,8 +409,8 @@ test('spineless hip swivel engine clamps hipR/hipL bounds, keeps inter-hip bridg
   extreme.joints.hipL.localAngle = -65;
 
   const computedExtreme = computeArmature(extreme);
-  assert.ok(computedExtreme.hipR.localAngle <= 21 && computedExtreme.hipR.localAngle >= 18);
-  assert.ok(computedExtreme.hipL.localAngle >= -21 && computedExtreme.hipL.localAngle <= -18);
+  assert.ok(computedExtreme.hipR.localAngle <= 22.5 && computedExtreme.hipR.localAngle >= 19.5);
+  assert.ok(computedExtreme.hipL.localAngle >= -22.5 && computedExtreme.hipL.localAngle <= -19.5);
   const extremeHipSpan = Math.hypot(
     computedExtreme.femurL.x - computedExtreme.femurR.x,
     computedExtreme.femurL.y - computedExtreme.femurR.y
@@ -467,6 +653,8 @@ test('collarbones favor downward rotation by default and smoothly ease upward wh
   // Neutral / downward arm elevation favors downward (-1) fold when compressed
   const rest = resolveCollarToggleFold('R', 0, 0, -5);
   assert.equal(rest.foldSign, -1);
+  assert.equal(resolveCollarToggleFold('R', 0.25, 0, -5).foldSign, -1);
+  assert.equal(resolveCollarToggleFold('L', -0.25, 0, -5).foldSign, -1);
 
   const pose = createPosePreset('tpose');
   pose.joints.swivelR.localAngle = 10;
@@ -542,6 +730,8 @@ test('waist balance/hula moves pelvis laterally and vertically with planted feet
   assert.ok(Math.hypot(after.footR.x - footRPin.x, after.footR.y - footRPin.y) < 0.75, 'footR remained planted on floor');
   assert.ok(Math.hypot(after.footL.x - footLPin.x, after.footL.y - footLPin.y) < 0.75, 'footL remained planted on floor');
   assert.ok(Math.abs(hulaSquat.rootRotation) > 1 && Math.abs(after.pelvis.localAngle) > 1, 'pelvic hula tilt engaged');
+  assert.notEqual(hulaSquat.joints.thorax.localAngle, base.joints.thorax.localAngle, 'thorax compensates');
+  assert.notEqual(hulaSquat.joints.neck.localAngle, base.joints.neck.localAngle, 'neck compensates');
 
   // Extreme upward pull never stretches or detaches cardboard-cutout leg bones
   const overPull = solveWaistBalanceHula(base, start.pelvis.x + 220, start.pelvis.y - 450, footRPin, footLPin);
@@ -554,6 +744,90 @@ test('waist balance/hula moves pelvis laterally and vertically with planted feet
   assert.ok(Math.abs(curL1L - L1L) < 1e-4 && Math.abs(curL2L - L2L) < 1e-4, 'left leg rigid');
   assert.ok(Math.hypot(afterOver.footR.x - afterOver.femurR.x, afterOver.footR.y - afterOver.femurR.y) <= L1R + L2R + 1e-3);
   assert.ok(Math.hypot(afterOver.footL.x - afterOver.femurL.x, afterOver.footL.y - afterOver.femurL.y) <= L1L + L2L + 1e-3);
+});
+
+test('body balance centers weight upper and lower segments separately around ankle support', () => {
+  const upright = computeArmature(createPosePreset('tpose'));
+  const centers = computeBodyBalanceCenters(upright);
+  assert.ok(centers.upperMass > 0 && centers.lowerMass > 0);
+  assert.ok(Number.isFinite(centers.whole.x) && Number.isFinite(centers.whole.y));
+  assert.ok(
+    Math.abs(
+      centers.whole.x -
+        (centers.upper.x * centers.upperMass + centers.lower.x * centers.lowerMass) /
+          (centers.upperMass + centers.lowerMass)
+    ) < 1e-4,
+    'whole-body center combines upper and lower mass centers'
+  );
+
+  const tiltedState = createPosePreset('tpose');
+  tiltedState.joints.lumbar.localAngle = 24;
+  const tilted = computeBodyBalanceCenters(computeArmature(tiltedState));
+  assert.ok(
+    Math.abs(tilted.upper.x - centers.upper.x) > 20,
+    'upper-body center responds to torso lean independently of the lower-body center'
+  );
+  assert.ok(Math.abs(tilted.lower.x - centers.lower.x) < 1e-4);
+});
+
+test('pressure plate pins both toes within joint limits and hard-stops at their shared reach', () => {
+  const base = createPosePreset('tpose');
+  const start = computeArmature(base);
+  const startY = Math.max(start.toeR.y, start.toeL.y);
+
+  for (const targetY of [startY - 24, startY + 24]) {
+    const result = solvePressurePlateContact(base, targetY);
+    const after = computeArmature(result.armature);
+    assert.equal(result.atHardStop, false);
+    assert.ok(Math.abs(result.pressurePlateY - targetY) < 1e-4);
+    assert.ok(Math.abs(after.toeR.y - targetY) < 1.5, 'right toe tracks the plate');
+    assert.ok(Math.abs(after.toeL.y - targetY) < 1.5, 'left toe tracks the plate');
+  }
+
+  const extreme = solvePressurePlateContact(base, startY + 2000);
+  const extremeJoints = computeArmature(extreme.armature);
+  assert.equal(extreme.atHardStop, true);
+  assert.ok(extreme.pressurePlateY < startY + 2000, 'unreachable plate travel is clamped');
+  assert.ok(Math.abs(extremeJoints.toeR.y - extreme.pressurePlateY) < 2);
+  assert.ok(Math.abs(extremeJoints.toeL.y - extreme.pressurePlateY) < 2);
+});
+
+test('torso center IK tracks the handle with stronger full-body compensation and planted feet', () => {
+  const base = createPosePreset('tpose');
+  const start = computeArmature(base);
+  const torsoStart = computeTorsoCenter(start);
+  const target = { x: torsoStart.x + 18, y: torsoStart.y + 42 };
+  const footRPin = { x: start.footR.x, y: start.footR.y, worldAngle: start.footR.worldAngle };
+  const footLPin = { x: start.footL.x, y: start.footL.y, worldAngle: start.footL.worldAngle };
+
+  const result = solveTorsoBalance(
+    base,
+    target.x,
+    target.y,
+    footRPin,
+    footLPin,
+    undefined,
+    {
+      baseRootRotation: base.rootRotation,
+      baseLumbarAngle: base.joints.lumbar.localAngle,
+      baseThoraxAngle: base.joints.thorax.localAngle,
+      baseNeckAngle: base.joints.neck.localAngle,
+      startPelvisX: start.pelvis.x,
+      startPelvisY: start.pelvis.y,
+    }
+  );
+  const after = computeArmature(result);
+  const torsoAfter = computeTorsoCenter(after);
+
+  assert.ok(
+    Math.hypot(torsoAfter.x - target.x, torsoAfter.y - target.y) <
+      Math.hypot(torsoStart.x - target.x, torsoStart.y - target.y),
+    'torso center moves toward its target'
+  );
+  assert.ok(Math.hypot(after.footR.x - footRPin.x, after.footR.y - footRPin.y) < 0.75);
+  assert.ok(Math.hypot(after.footL.x - footLPin.x, after.footL.y - footLPin.y) < 0.75);
+  assert.notEqual(result.joints.thorax.localAngle, base.joints.thorax.localAngle);
+  assert.notEqual(result.joints.neck.localAngle, base.joints.neck.localAngle);
 });
 
 test('collar and hip bones remain strictly non-elastic (zero stretch) across lengthened full-range poses', () => {
@@ -702,4 +976,86 @@ test('pose & toggle transition interpolation detects deltas, blends scales, and 
   const hipMid = interpolateArmatures(hipA, hipV, 0.5, 'mechanical');
   assert.ok(Math.abs(hipMid.joints.hipR.localAngle - 20.8) < 1e-3);
   assert.ok(Math.abs(hipMid.joints.hipL.localAngle - -20.8) < 1e-3);
+});
+
+test('sampled compound-pose interpolation keeps rig geometry finite and continuous', () => {
+  const origin = { x: 681.5, y: 900 };
+  const from = createPosePreset('tpose');
+  const fromComputed = computeArmature(from, origin);
+  let to = solveFaceplateLookIK(
+    from,
+    fromComputed.lip.x + 120,
+    fromComputed.lip.y - 45,
+    origin
+  );
+  to = setFaceplateOffset(to, FACEPLATE_SLIDE_LIMIT_SVG, -FACEPLATE_SLIDE_LIMIT_SVG);
+  to = setHipToggleState(to, 'V');
+  to = setArmReverseSwivel(to, 'R', 180);
+  to = { ...to, neckLift: 24 };
+
+  let previousComputed = fromComputed;
+  const pathLengthByJoint = new Map<string, number>(
+    JOINT_SPECS.map((spec) => [spec.id, 0] as [string, number])
+  );
+  const maxFrameStepByJoint = new Map<string, number>(
+    JOINT_SPECS.map((spec) => [spec.id, 0] as [string, number])
+  );
+
+  for (let frameIndex = 0; frameIndex <= 20; frameIndex++) {
+    const elapsedMs = (320 * frameIndex) / 20;
+    const frame = computePoseTransitionFrame(from, to, elapsedMs, 320, 'flow');
+    const computed = computeArmature(frame.armature, origin);
+    const geometry = buildCaveArtGeometry(computed);
+
+    for (const spec of JOINT_SPECS) {
+      const joint = computed[spec.id];
+      assert.ok(
+        [joint.x, joint.y, joint.endX, joint.endY, joint.worldAngle].every(Number.isFinite),
+        `frame ${frameIndex}: ${spec.id} stays finite`
+      );
+      if (frameIndex > 0) {
+        const previous = previousComputed[spec.id];
+        const frameStep = Math.hypot(
+          joint.x - previous.x,
+          joint.y - previous.y,
+          joint.endX - previous.endX,
+          joint.endY - previous.endY
+        );
+        pathLengthByJoint.set(
+          spec.id,
+          (pathLengthByJoint.get(spec.id) ?? 0) + frameStep
+        );
+        maxFrameStepByJoint.set(
+          spec.id,
+          Math.max(maxFrameStepByJoint.get(spec.id) ?? 0, frameStep)
+        );
+      }
+    }
+
+    for (const polygon of geometry.polygons) {
+      assert.ok(polygon.points.length >= 3, `${polygon.id} retains a drawable shape`);
+      assert.ok(
+        polygon.points.every((point) => Number.isFinite(point.x) && Number.isFinite(point.y)),
+        `${polygon.id} vertices stay finite`
+      );
+    }
+    for (const line of geometry.functionalLines) {
+      assert.ok(
+        [line.x1, line.y1, line.x2, line.y2].every(Number.isFinite),
+        `${line.id} coordinates stay finite`
+      );
+      assert.ok(Math.hypot(line.x2 - line.x1, line.y2 - line.y1) > 1e-2, `${line.id} stays drawable`);
+    }
+
+    previousComputed = computed;
+  }
+
+  for (const spec of JOINT_SPECS) {
+    const pathLength = pathLengthByJoint.get(spec.id) ?? 0;
+    const maxFrameStep = maxFrameStepByJoint.get(spec.id) ?? 0;
+    assert.ok(
+      maxFrameStep < Math.max(4, pathLength * 0.2),
+      `${spec.id} frame step (${maxFrameStep}) does not dominate its sampled path (${pathLength})`
+    );
+  }
 });

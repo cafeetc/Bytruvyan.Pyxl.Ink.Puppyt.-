@@ -14,6 +14,7 @@ import {
 import { BookStageCanvas } from './components/BookStageCanvas';
 import { BottomAnimationDrawer } from './components/playground/BottomAnimationDrawer';
 import { ModularWorkspaceOverlay } from './components/playground/ModularWorkspaceOverlay';
+import { PoseStreamControl } from './components/PoseStreamControl';
 import { JOINT_SPEC_MAP } from './data/digitalRig';
 import { GridConfig, PageId } from './types/canvas';
 import {
@@ -60,6 +61,7 @@ import {
   interpolateArmatures,
   mirrorPose,
   resolveCollarInwardBehavior,
+  setBalancedSpineLean,
   setCollarToggleState,
   setHipToggleState,
   synthesizeProceduralBreakdown,
@@ -80,6 +82,7 @@ import {
   SAMPLE_PLATES,
   advanceSequencePlayback,
   cloneSceneForNewShot,
+  createShotBridgeSlots,
   createDefaultScene,
   createDefaultSceneMedia,
   createSamplePlateMedia,
@@ -105,10 +108,12 @@ import {
   formatExportTimestamp,
   savePoseDataFile,
 } from './utils/poseExport';
+import { buildPoseTelemetrySnapshot } from './utils/poseTelemetry';
 
 // Load directly with the Cover state as the active canvas backdrop
 const INITIAL_PAGE: PageId = 'page-22';
 const SAVED_POSES_STORAGE_KEY = 'bitruvius.savedPoses.v1';
+const POSE_STREAM_WORKSPACE_ID = 'bitruvius-ink-manual-kinematics-studio';
 const CANVAS_ORIGIN = { x: PAPER_WIDTH / 2, y: PAPER_HEIGHT / 2 };
 
 function loadSavedPoses(): UserSavedPose[] {
@@ -290,6 +295,30 @@ export default function App() {
     () => computeArmature(armature, CANVAS_ORIGIN),
     [armature]
   );
+  const poseTelemetry = useMemo(
+    () =>
+      buildPoseTelemetrySnapshot({
+        workspaceId: POSE_STREAM_WORKSPACE_ID,
+        scene: {
+          id: resolvedActiveScene.id,
+          name: resolvedActiveScene.name,
+          timelineT: resolvedActiveScene.timelineT,
+          durationSec: resolvedActiveScene.durationSec,
+          playbackSpeed: resolvedActiveScene.playbackSpeed,
+        },
+        armature,
+        computedJoints,
+      }),
+    [
+      armature,
+      computedJoints,
+      resolvedActiveScene.durationSec,
+      resolvedActiveScene.id,
+      resolvedActiveScene.name,
+      resolvedActiveScene.playbackSpeed,
+      resolvedActiveScene.timelineT,
+    ]
+  );
 
   const updateActiveScene = useCallback((updater: (scene: Scene) => Scene) => {
     setScenes((prev) => {
@@ -302,21 +331,22 @@ export default function App() {
     (candidate: ArmatureState): ArmatureState => {
       if (!rigSystems.floorSnap || candidate.isAnchorPinned) return candidate;
       const joints = computeArmature(candidate, CANVAS_ORIGIN);
+      const groundY = rigSystems.pressurePlateY ?? rigSystems.groundY;
       const maxFootY = Math.max(
         joints.footR.endY,
         joints.footL.endY,
         joints.toeR.endY,
         joints.toeL.endY
       );
-      if (maxFootY > rigSystems.groundY) {
+      if (maxFootY > groundY) {
         return {
           ...candidate,
-          rootY: candidate.rootY - (maxFootY - rigSystems.groundY),
+          rootY: candidate.rootY - (maxFootY - groundY),
         };
       }
       return candidate;
     },
-    [rigSystems.floorSnap, rigSystems.groundY]
+    [rigSystems.floorSnap, rigSystems.groundY, rigSystems.pressurePlateY]
   );
 
   const applySceneConstraints = useCallback(
@@ -417,7 +447,8 @@ export default function App() {
     (factor: number) => {
       const curZoom = activeSceneRef.current.camera.zoom;
       const curPan = activeSceneRef.current.camera.pan;
-      const nextZoom = Math.max(0.1, Math.min(2.4, curZoom * factor));
+      const minZoom = computeSymmetricalFitZoom(viewportSize.width, viewportSize.height);
+      const nextZoom = Math.max(minZoom, Math.min(2.4, curZoom * factor));
       const cx = viewportSize.width / 2;
       const cy = viewportSize.height / 2;
       const worldX = (cx - curPan.x) / curZoom;
@@ -439,16 +470,18 @@ export default function App() {
 
   const handleSetExactZoom = useCallback(
     (targetZoom: number) => {
+      const minZoom = computeSymmetricalFitZoom(viewportSize.width, viewportSize.height);
+      const nextZoom = Math.max(minZoom, Math.min(2.4, targetZoom));
       updateActiveScene((s) => ({
         ...s,
         camera: {
-          zoom: targetZoom,
+          zoom: nextZoom,
           pan: computeSymmetricalCenterPan(
             viewportSize.width,
             viewportSize.height,
             CANVAS_ORIGIN.x,
             CANVAS_ORIGIN.y,
-            targetZoom
+            nextZoom
           ),
           userEdited: true,
         },
@@ -849,7 +882,7 @@ export default function App() {
       const a = scene.slots.A;
       const b = scene.slots.B;
       const c = scene.slots.C;
-      let candidate = scene.armature;
+      let candidate = a ?? scene.armature;
       if (a) {
         if (b && c) {
           candidate =
@@ -1107,7 +1140,9 @@ export default function App() {
         ...s,
         activePreset: null,
         armature:
-          id === 'pelvis'
+          id === 'lumbar' || id === 'thorax' || id === 'neck'
+            ? setBalancedSpineLean(s.armature, id, localAngle)
+            : id === 'pelvis'
             ? { ...s.armature, rootRotation: localAngle }
             : {
                 ...s.armature,
@@ -1180,12 +1215,53 @@ export default function App() {
 
   // Scene Sequencer & Media Compositing Handlers
   const handleSelectScene = useCallback(
-    (sceneId: string) => {
+    (sceneId: string, clickCount = 1) => {
       cancelPoseTransition();
       setIsPlaying(false);
       setActiveSceneId(sceneId);
+      const currentScenes = scenesRef.current;
+      const sceneIndex = currentScenes.findIndex((scene) => scene.id === sceneId);
+      const selectedScene = currentScenes[sceneIndex];
+      if (!selectedScene) return;
+
+      if (clickCount >= 3) {
+        const tPose = createPosePreset('tpose', selectedScene.armature);
+        setScenes((prev) =>
+          prev.map((scene) =>
+            scene.id === sceneId
+              ? {
+                  ...scene,
+                  slots: { ...scene.slots, A: tPose },
+                  activeSlot: null,
+                  activePreset: null,
+                }
+              : scene
+          )
+        );
+        return;
+      }
+
+      if (clickCount === 2 && sceneIndex > 0) {
+        const previousScene = currentScenes[sceneIndex - 1];
+        const previousEndPose = evaluateSceneArmatureAt(previousScene, 1);
+        const nextScene = currentScenes[sceneIndex + 1];
+        const slots = nextScene
+          ? createShotBridgeSlots(
+              previousEndPose,
+              evaluateSceneArmatureAt(nextScene, 0),
+              selectedScene.motionCurve
+            )
+          : { ...selectedScene.slots, A: structuredClone(previousEndPose) };
+        setScenes((prev) =>
+          prev.map((scene) =>
+            scene.id === sceneId
+              ? { ...scene, slots, activeSlot: null, activePreset: null }
+              : scene
+          )
+        );
+      }
     },
-    [cancelPoseTransition]
+    [cancelPoseTransition, evaluateSceneArmatureAt]
   );
 
   const handleAddScene = useCallback(() => {
@@ -1601,16 +1677,17 @@ export default function App() {
             (base) => {
               if (base.isAnchorPinned) return base;
               const joints = computeArmature(base, CANVAS_ORIGIN);
+              const groundY = next.pressurePlateY ?? next.groundY;
               const maxFootY = Math.max(
                 joints.footR.endY,
                 joints.footL.endY,
                 joints.toeR.endY,
                 joints.toeL.endY
               );
-              if (maxFootY > next.groundY) {
+              if (maxFootY > groundY) {
                 return {
                   ...base,
-                  rootY: base.rootY - (maxFootY - next.groundY),
+                  rootY: base.rootY - (maxFootY - groundY),
                 };
               }
               return base;
@@ -1800,6 +1877,8 @@ export default function App() {
 
         {/* System Display, Workspace Layout & Theme */}
         <div className="flex items-center gap-1 sm:gap-1.5 shrink-0">
+          <PoseStreamControl snapshot={poseTelemetry} />
+
           <button
             type="button"
             disabled={!isCover}
@@ -1955,6 +2034,7 @@ export default function App() {
             isPlaying={isPlaying}
             onCommitPoseHistory={commitPoseHistory}
             rigSystems={rigSystems}
+            onUpdateRigSystems={handleUpdateRigSystems}
             showPerspective={showPerspective}
             vanishingPoint={vanishingPoint}
             onVanishingPointChange={handleVanishingPointChange}

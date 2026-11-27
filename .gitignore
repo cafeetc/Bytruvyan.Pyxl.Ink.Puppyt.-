@@ -8,4 +8,6 @@ coverage/
 !.env.example
 .vite/
 .playwright-cli/
+.aistudio/
+.source-write.lock
 !.vscode/

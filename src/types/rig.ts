@@ -172,6 +172,7 @@ export interface ComputedJoint {
   tensionRatio?: number;
   collarSnapState?: 'normal' | 'resisting' | 'snapped';
   collarResistanceRatio?: number;
+  neckCollarPressureRatio?: number;
   armReverseFactor?: number;
 }
 
@@ -207,6 +208,10 @@ export interface ArmatureState {
   hipToggleSign?: 1 | -1;
   armSwivelR?: number;
   armSwivelL?: number;
+  faceplateOffsetX?: number;
+  faceplateOffsetY?: number;
+  neckLift?: number;
+  neckCollarSeparation?: Point2D;
   continuousSpin: boolean;
   internalKeystone: KeystoneOrigin;
   environmentalAnchor: EnvironmentalAnchorId;
@@ -217,6 +222,12 @@ export interface ArmatureState {
 export interface Point2D {
   x: number;
   y: number;
+}
+
+export interface GroundContactPin extends Point2D {
+  jointId?: 'footR' | 'toeR' | 'footL' | 'toeL';
+  supportWeight?: number;
+  worldAngle?: number;
 }
 
 export type CaveArtShapeKind = 'triangle' | 'trapezoid' | 'square';
@@ -309,6 +320,7 @@ export interface RigSystemsConfig {
   elasticPin: boolean;
   antiPhallic: boolean;
   groundY: number;
+  pressurePlateY?: number;
   solver: 'analytical' | 'fabrik' | 'ccd';
 }
 
