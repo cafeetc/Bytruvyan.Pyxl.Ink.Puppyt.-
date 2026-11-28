@@ -213,6 +213,7 @@ export const ModularWorkspaceOverlay: React.FC<ModularWorkspaceOverlayProps> = R
   const [handSide, setHandSide] = useState<'right' | 'left' | 'both'>('both');
   const [dragState, setDragState] = useState<ActivePanelDrag | null>(null);
   const [moduleSpawnNotice, setModuleSpawnNotice] = useState('');
+  const [isRailHovered, setIsRailHovered] = useState(false);
   const dragRef = useRef<ActivePanelDrag | null>(null);
 
   const selectedSpec = JOINT_SPEC_MAP[selectedJointId];
@@ -1349,8 +1350,53 @@ export const ModularWorkspaceOverlay: React.FC<ModularWorkspaceOverlayProps> = R
           {/* Slim Right Vertical Icon Menu (Quick Toggles + Module Launchers) */}
           <nav
             aria-label="Model quick toggles & modules"
+            onMouseEnter={() => setIsRailHovered(true)}
+            onMouseLeave={() => setIsRailHovered(false)}
             className="pointer-events-auto relative w-11 max-h-full overflow-y-auto shrink-0 bg-[#16001E]/88 backdrop-blur-md border border-[#EBE0F5]/16 rounded-[4px] p-1 flex flex-col items-center gap-0.5 shadow-xl"
           >
+            {isRailHovered && (
+              <div className="absolute right-full top-0 mr-2 w-44 bg-[#16001E]/96 backdrop-blur-md border border-[#EBE0F5]/20 rounded-[4px] p-1.5 shadow-2xl z-50 space-y-1 font-vera text-[10.5px] text-[#FAF6FF] pointer-events-none">
+                <div className="px-1.5 py-0.5 text-[9.5px] font-bold uppercase tracking-widest text-[#B8A9C9] border-b border-[#EBE0F5]/12 pb-1">
+                  Quick Actions &amp; Modules
+                </div>
+                <div className="px-1.5 py-0.5 flex items-center justify-between">
+                  <span className="text-[#C8B2E0]">Toggle Limbs IK</span>
+                  <span className="font-typewriter text-[9.5px] text-[#34D399]">{anyLimbIK ? 'IK' : 'FK'}</span>
+                </div>
+                <div className="px-1.5 py-0.5 flex items-center justify-between">
+                  <span className="text-[#C8B2E0]">Anatomical Limits</span>
+                  <span className="font-typewriter text-[9.5px] text-[#34D399]">{rigSystems.softLimits ? 'ON' : 'OFF'}</span>
+                </div>
+                <div className="px-1.5 py-0.5 flex items-center justify-between">
+                  <span className="text-[#C8B2E0]">Floor Plane Snap</span>
+                  <span className="font-typewriter text-[9.5px] text-[#34D399]">{rigSystems.floorSnap ? 'ON' : 'OFF'}</span>
+                </div>
+                <div className="px-1.5 py-0.5 flex items-center justify-between">
+                  <span className="text-[#C8B2E0]">Pin Anchor</span>
+                  <span className="font-typewriter text-[9.5px] text-[#D8B4FE]">{armature.isAnchorPinned ? 'PINNED' : 'FREE'}</span>
+                </div>
+                <div className="px-1.5 py-0.5 flex items-center justify-between">
+                  <span className="text-[#C8B2E0]">360° Spin</span>
+                  <span className="font-typewriter text-[9.5px] text-[#34D399]">{armature.continuousSpin ? 'ON' : 'OFF'}</span>
+                </div>
+                <div className="px-1.5 py-0.5 flex items-center justify-between">
+                  <span className="text-[#C8B2E0]">Perspective Horizon</span>
+                  <span className="font-typewriter text-[9.5px] text-[#34D399]">{showPerspective ? 'ON' : 'OFF'}</span>
+                </div>
+                <div className="px-1.5 py-0.5 text-[#C8B2E0]">Mirror Pose</div>
+                <div className="px-1.5 py-0.5 text-[#C8B2E0]">Reset to T-Pose</div>
+                <div className="border-t border-[#EBE0F5]/12 pt-1 mt-1 space-y-0.5">
+                  {MODEL_MODULE_META.map((meta) => (
+                    <div key={`label-${meta.id}`} className="px-1.5 py-0.5 flex items-center justify-between">
+                      <span className="text-[#D9CBE8]">{meta.label}</span>
+                      <span className="font-typewriter text-[9.5px] text-[#6EE7B7]">
+                        {panels[meta.id].isOpen ? 'Open' : 'Launch'}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
             {/* Quick Model Toggles */}
             <button
               type="button"

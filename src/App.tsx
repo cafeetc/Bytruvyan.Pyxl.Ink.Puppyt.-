@@ -266,6 +266,7 @@ export default function App() {
       antiPhallic: true,
       groundY: PAPER_HEIGHT / 2 + canons.eightHeadTotalPx / 2,
       solver: 'analytical',
+      showSwivelsAndJoints: true,
     };
   });
 

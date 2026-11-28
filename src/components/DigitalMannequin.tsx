@@ -89,11 +89,15 @@ export const DigitalMannequin: React.FC<DigitalMannequinProps> = React.memo(({
   const coreStdDev = Number((Math.max(0.15, 0.75 - (edgeThreshold / 100) * 0.55)).toFixed(2));
   const alphaSlope = Number((1.0 + (edgeThreshold / 100) * 0.65).toFixed(2));
   const bodyFill = darkMode ? DARK_MODE_BONE_GREEN : 'url(#bitruvius-ink-body-grad)';
-  const faceFill = darkMode ? DARK_MODE_FLESH_GREEN : 'url(#bitruvius-face-grad)';
+  const faceFill = darkMode ? '#D8B4FE' : 'url(#bitruvius-face-grad)';
   const greenJoint = darkMode ? DARK_MODE_BONE_GREEN : REPO_GREEN_JOINT_LIGHT;
   const greenGlow = darkMode ? DARK_MODE_HIGHLIGHT_PURPLE : REPO_GREEN_GLOW_LIGHT;
   const hoverAccent = greenGlow;
   const activeAccent = greenGlow;
+  const darkGreenFill = darkMode ? '#064E3B' : '#143828';
+  const getSwivelFill = (id: JointId) => (hoveredJointId === id ? faceFill : darkGreenFill);
+  const getSpineFill = () => (hoveredJointId === 'lumbar' || hoveredJointId === 'thorax' ? faceFill : darkGreenFill);
+  const getHipFill = (id: JointId) => (hoveredJointId === id ? faceFill : darkGreenFill);
 
   const svgMatrices = useMemo(() => {
     const m = (id: JointId, mirrorX = false) =>
@@ -295,9 +299,9 @@ export const DigitalMannequin: React.FC<DigitalMannequinProps> = React.memo(({
         </linearGradient>
 
         <radialGradient id="bitruvius-face-grad" cx="42%" cy="38%" r="65%">
-          <stop offset="0%" stopColor={darkMode ? '#742B94' : '#651982'} stopOpacity={darkMode ? 0.92 : 0.86} />
-          <stop offset="65%" stopColor={darkMode ? '#581974' : '#4D0A68'} stopOpacity={darkMode ? 0.94 : 0.88} />
-          <stop offset="100%" stopColor={darkMode ? '#3E0D54' : '#3A0452'} stopOpacity={darkMode ? 0.96 : 0.91} />
+          <stop offset="0%" stopColor={darkMode ? '#D8B4FE' : '#C084FC'} stopOpacity={darkMode ? 0.95 : 0.90} />
+          <stop offset="65%" stopColor={darkMode ? '#C084FC' : '#A855F7'} stopOpacity={darkMode ? 0.96 : 0.92} />
+          <stop offset="100%" stopColor={darkMode ? '#A855F7' : '#9333EA'} stopOpacity={darkMode ? 0.98 : 0.94} />
         </radialGradient>
 
         {/* Subtle Leonardo pen cross-hatching texture */}

@@ -314,6 +314,9 @@ export type MotionCurve =
   | 'clockwork'
   | 'procedural';
 
+export type GroundPlaneMode = 'static' | 'pressure';
+export type GroundReactionTrigger = 'primary' | 'all';
+
 export interface RigSystemsConfig {
   softLimits: boolean;
   floorSnap: boolean;
@@ -321,7 +324,10 @@ export interface RigSystemsConfig {
   antiPhallic: boolean;
   groundY: number;
   pressurePlateY?: number;
+  groundMode?: GroundPlaneMode;
+  reactionTrigger?: GroundReactionTrigger;
   solver: 'analytical' | 'fabrik' | 'ccd';
+  showSwivelsAndJoints?: boolean;
 }
 
 export type HandGesturePreset = 'open' | 'fist' | 'point' | 'pinch' | 'relaxed' | 'grasp';

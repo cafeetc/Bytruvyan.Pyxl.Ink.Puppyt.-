@@ -1442,29 +1442,7 @@ export const BookStageCanvas: React.FC<BookStageCanvasProps> = React.memo(({
                   },
                 },
               };
-        if (
-          (targetJointId === 'hipR' || targetJointId === 'hipL') &&
-          activeDrag.startPelvis &&
-          activeDrag.footRPin &&
-          activeDrag.footLPin
-        ) {
-          nextArmature = solveWaistBalanceHula(
-            nextArmature,
-            activeDrag.startPelvis.x,
-            activeDrag.startPelvis.y,
-            activeDrag.footRPin,
-            activeDrag.footLPin,
-            originOffset,
-            {
-              baseRootRotation: activeDrag.startRootRotation,
-              baseLumbarAngle: activeDrag.startLumbarAngle,
-              baseThoraxAngle: activeDrag.startThoraxAngle,
-              baseNeckAngle: activeDrag.startNeckAngle,
-              startPelvisX: activeDrag.startPelvis.x,
-              startPelvisY: activeDrag.startPelvis.y,
-            }
-          );
-        }
+
         armatureRef.current = nextArmature;
         enqueueScreenUpdate({ ...cursorPatch, armature: nextArmature });
       }

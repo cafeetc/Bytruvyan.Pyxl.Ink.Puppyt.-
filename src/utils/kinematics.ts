@@ -31,7 +31,12 @@ import {
   ToggleHinge2LinkResult,
   ToggleHingeFoldState,
 } from '../types/rig';
-import { PAPER_HEIGHT, PAPER_WIDTH, PUPPYT_TO_EVOLVED_SCALE } from './proportions';
+import {
+  PAPER_HEIGHT,
+  PAPER_WIDTH,
+  PUPPYT_TO_EVOLVED_SCALE,
+  computeProportionalCanons,
+} from './proportions';
 
 export type Affine2D = readonly [number, number, number, number, number, number];
 
@@ -364,123 +369,50 @@ export interface CollarInwardBehaviorResult {
 export function resolveCollarInwardBehavior(
   side: 'R' | 'L',
   localAngle: number,
-  otherSwivelLocalAngle: number
+  _otherSwivelLocalAngle?: number
 ): CollarInwardBehaviorResult {
-  const inward = side === 'R' ? localAngle : -localAngle;
-  if (inward > COLLAR_INWARD_NORMAL_LIMIT_DEG + 0.5) {
-    const otherClamped = Math.max(
-      -COLLAR_INWARD_NORMAL_LIMIT_DEG,
-      Math.min(COLLAR_INWARD_NORMAL_LIMIT_DEG, otherSwivelLocalAngle)
-    );
-    const snapAngle =
-      side === 'R'
-        ? 2 * SWIVEL_REST_OFFSET_DEG + otherClamped
-        : -2 * SWIVEL_REST_OFFSET_DEG + otherClamped;
-    return {
-      snapState: 'snapped',
-      resistanceRatio: 1,
-      effectiveLocalAngle: Math.max(
-        -COLLAR_SWIVEL_MAX_INWARD_DEG,
-        Math.min(COLLAR_SWIVEL_MAX_INWARD_DEG, snapAngle)
-      ),
-    };
-  }
-  if (inward >= COLLAR_INWARD_RESISTANCE_START_DEG) {
-    const clampedInward = Math.min(COLLAR_INWARD_NORMAL_LIMIT_DEG, inward);
-    const resistanceRatio = Math.max(
-      0,
-      Math.min(
-        1,
-        (clampedInward - COLLAR_INWARD_RESISTANCE_START_DEG) /
-          (COLLAR_INWARD_NORMAL_LIMIT_DEG - COLLAR_INWARD_RESISTANCE_START_DEG)
-      )
-    );
-    return {
-      snapState: 'resisting',
-      resistanceRatio,
-      effectiveLocalAngle: side === 'R' ? clampedInward : -clampedInward,
-    };
-  }
-  const normalClamped = Math.max(-COLLAR_INWARD_NORMAL_LIMIT_DEG, localAngle);
+  const minAngle = side === 'R' ? -COLLAR_INWARD_NORMAL_LIMIT_DEG : -COLLAR_SWIVEL_MAX_INWARD_DEG;
+  const maxAngle = side === 'R' ? COLLAR_SWIVEL_MAX_INWARD_DEG : COLLAR_INWARD_NORMAL_LIMIT_DEG;
+  const clamped = Math.max(minAngle, Math.min(maxAngle, localAngle));
+  const inward = side === 'R' ? clamped : -clamped;
+
+  const resistanceRatio =
+    inward >= COLLAR_INWARD_RESISTANCE_START_DEG
+      ? Math.max(
+          0,
+          Math.min(
+            1,
+            (inward - COLLAR_INWARD_RESISTANCE_START_DEG) /
+              Math.max(1e-4, COLLAR_SWIVEL_MAX_INWARD_DEG - COLLAR_INWARD_RESISTANCE_START_DEG)
+          )
+        )
+      : 0;
+
   return {
-    snapState: 'normal',
-    resistanceRatio: 0,
-    effectiveLocalAngle: normalClamped,
+    snapState: inward > COLLAR_INWARD_NORMAL_LIMIT_DEG ? 'resisting' : 'normal',
+    resistanceRatio,
+    effectiveLocalAngle: clamped,
   };
 }
 
 /**
- * Applies interactive FK drag input to `swivelR` / `swivelL` with an inward resistance detent
- * near `16°` (`11.5°..21.5°` input damped to `11.5°..16°`) before snapping onto the opposite collar.
+ * Applies interactive FK drag input to `swivelR` / `swivelL` with smooth continuous interpolation
+ * directly following pointer movement without discrete snap jumps.
  */
 export function applyCollarSwivelDragInput(
   state: ArmatureState,
   side: 'R' | 'L',
   rawDragAngle: number
 ): { nextAngle: number; nextRawAngle: number; behavior: CollarInwardBehaviorResult } {
-  const selfId: JointId = side === 'R' ? 'swivelR' : 'swivelL';
-  const otherId: JointId = side === 'R' ? 'swivelL' : 'swivelR';
-  const currentLocal = state.joints[selfId]?.localAngle ?? 0;
-  const otherLocal = state.joints[otherId]?.localAngle ?? 0;
-
-  const clampedRaw =
-    side === 'R'
-      ? Math.max(-COLLAR_INWARD_NORMAL_LIMIT_DEG, Math.min(COLLAR_SWIVEL_MAX_INWARD_DEG, rawDragAngle))
-      : Math.max(-COLLAR_SWIVEL_MAX_INWARD_DEG, Math.min(COLLAR_INWARD_NORMAL_LIMIT_DEG, rawDragAngle));
-
-  const rawInward = side === 'R' ? clampedRaw : -clampedRaw;
-  const wasSnapped = (side === 'R' ? currentLocal : -currentLocal) > COLLAR_INWARD_NORMAL_LIMIT_DEG + 0.5;
-
-  if (wasSnapped) {
-    if (rawInward >= COLLAR_UNSNAP_HYSTERESIS_DEG) {
-      const snappedBehavior = resolveCollarInwardBehavior(side, COLLAR_INWARD_BREAKAWAY_DEG + 1, otherLocal);
-      return {
-        nextAngle: snappedBehavior.effectiveLocalAngle,
-        nextRawAngle: clampedRaw,
-        behavior: snappedBehavior,
-      };
-    }
-    const unsnappedAngle = side === 'R' ? Math.min(COLLAR_INWARD_NORMAL_LIMIT_DEG, rawInward) : -Math.min(COLLAR_INWARD_NORMAL_LIMIT_DEG, rawInward);
-    const behavior = resolveCollarInwardBehavior(side, unsnappedAngle, otherLocal);
-    return {
-      nextAngle: behavior.effectiveLocalAngle,
-      nextRawAngle: clampedRaw,
-      behavior,
-    };
-  }
-
-  if (rawInward > COLLAR_INWARD_BREAKAWAY_DEG) {
-    const snappedBehavior = resolveCollarInwardBehavior(side, rawInward, otherLocal);
-    return {
-      nextAngle: snappedBehavior.effectiveLocalAngle,
-      nextRawAngle: clampedRaw,
-      behavior: snappedBehavior,
-    };
-  }
-
-  if (rawInward >= COLLAR_INWARD_RESISTANCE_START_DEG) {
-    const span = COLLAR_INWARD_BREAKAWAY_DEG - COLLAR_INWARD_RESISTANCE_START_DEG;
-    const t = Math.max(0, Math.min(1, (rawInward - COLLAR_INWARD_RESISTANCE_START_DEG) / span));
-    const resistedInward =
-      COLLAR_INWARD_RESISTANCE_START_DEG +
-      t * (COLLAR_INWARD_NORMAL_LIMIT_DEG - COLLAR_INWARD_RESISTANCE_START_DEG);
-    const resistedAngle = side === 'R' ? resistedInward : -resistedInward;
-    return {
-      nextAngle: snapAnglePrecision(resistedAngle),
-      nextRawAngle: clampedRaw,
-      behavior: {
-        snapState: 'resisting',
-        resistanceRatio: t,
-        effectiveLocalAngle: snapAnglePrecision(resistedAngle),
-      },
-    };
-  }
-
-  const normalAngle = snapAnglePrecision(clampedRaw);
+  const minAngle = side === 'R' ? -COLLAR_INWARD_NORMAL_LIMIT_DEG : -COLLAR_SWIVEL_MAX_INWARD_DEG;
+  const maxAngle = side === 'R' ? COLLAR_SWIVEL_MAX_INWARD_DEG : COLLAR_INWARD_NORMAL_LIMIT_DEG;
+  const clampedRaw = Math.max(minAngle, Math.min(maxAngle, rawDragAngle));
+  const behavior = resolveCollarInwardBehavior(side, clampedRaw);
+  const nextAngle = snapAnglePrecision(clampedRaw);
   return {
-    nextAngle: normalAngle,
+    nextAngle,
     nextRawAngle: clampedRaw,
-    behavior: resolveCollarInwardBehavior(side, normalAngle, otherLocal),
+    behavior,
   };
 }
 
@@ -1061,27 +993,13 @@ function evaluateRawArmature(state: ArmatureState): Record<JointId, ComputedJoin
         y: thorax.y + neckSeparation.y,
       };
       const thoraxTilt = thorax ? thorax.localAngle : (state.joints.thorax?.localAngle ?? 0);
-      if (behavior.snapState === 'snapped') {
-        bondedLocalAngle = Math.max(
-          -COLLAR_SWIVEL_MAX_INWARD_DEG,
-          Math.min(COLLAR_SWIVEL_MAX_INWARD_DEG, behavior.effectiveLocalAngle + thoraxTilt * 0.35)
-        );
-      } else {
-        bondedLocalAngle = Math.max(
-          -COLLAR_INWARD_NORMAL_LIMIT_DEG,
-          Math.min(
-            COLLAR_INWARD_NORMAL_LIMIT_DEG,
-            behavior.effectiveLocalAngle + thoraxTilt * 0.35
-          )
-        );
-      }
+      bondedLocalAngle = behavior.effectiveLocalAngle + thoraxTilt * 0.35;
 
       const outwardSplay = NECK_LIFT_MAX_SWIVEL_SPLAY_DEG * easedNeckLift;
       bondedLocalAngle += isRight ? -outwardSplay : outwardSplay;
-      bondedLocalAngle = Math.max(
-        spec.limits?.[0] ?? -COLLAR_INWARD_NORMAL_LIMIT_DEG,
-        Math.min(spec.limits?.[1] ?? COLLAR_INWARD_NORMAL_LIMIT_DEG, bondedLocalAngle)
-      );
+      const minLim = spec.limits?.[0] ?? (isRight ? -COLLAR_INWARD_NORMAL_LIMIT_DEG : -COLLAR_SWIVEL_MAX_INWARD_DEG);
+      const maxLim = spec.limits?.[1] ?? (isRight ? COLLAR_SWIVEL_MAX_INWARD_DEG : COLLAR_INWARD_NORMAL_LIMIT_DEG);
+      bondedLocalAngle = Math.max(minLim, Math.min(maxLim, bondedLocalAngle));
 
       // Enforce strict non-stretching rigid two-piece collarbone reach via circle-circle intersection
       const braceSpec = JOINT_SPEC_MAP[isRight ? 'braceR' : 'braceL'];
@@ -1129,8 +1047,14 @@ function evaluateRawArmature(state: ArmatureState): Record<JointId, ComputedJoin
             )
           );
           const h = Math.sqrt(Math.max(0, swivelRadius * swivelRadius - a * a));
-          const clampedAcroX = originPt.x + a * ux + h * latX;
-          const clampedAcroY = originPt.y + a * uy + h * latY;
+          const cand1X = originPt.x + a * ux + h * latX;
+          const cand1Y = originPt.y + a * uy + h * latY;
+          const cand2X = originPt.x + a * ux - h * latX;
+          const cand2Y = originPt.y + a * uy - h * latY;
+          const dist1 = Math.hypot(cand1X - desiredAcroX, cand1Y - desiredAcroY);
+          const dist2 = Math.hypot(cand2X - desiredAcroX, cand2Y - desiredAcroY);
+          const clampedAcroX = dist1 <= dist2 ? cand1X : cand2X;
+          const clampedAcroY = dist1 <= dist2 ? cand1Y : cand2Y;
           const clampedWorldDeg =
             Math.atan2(clampedAcroY - originPt.y, clampedAcroX - originPt.x) * RAD_TO_DEG;
           bondedLocalAngle = normalizeAngleDeg(
@@ -2185,7 +2109,36 @@ export function setCollarToggleState(
  * Strictly clamps waist motion inside the intersection of both leg reach envelopes so
  * cardboard-cutout legs and hips NEVER stretch or detach from their sockets.
  */
-type WaistBalanceOptions = {
+export const GROUND_CONTACT_TOLERANCE_PX = 12;
+
+export function getGroundContactPin(
+  ankle: ComputedJoint,
+  toe: ComputedJoint,
+  groundY: number,
+  side: 'R' | 'L',
+  lockToGround: boolean = false
+): GroundContactPin {
+  const ankleDistance = Math.abs(groundY - ankle.y);
+  const toeDistance = Math.abs(groundY - toe.y);
+  const ankleIsCloser = ankleDistance <= toeDistance;
+  const contactDistance = Math.min(ankleDistance, toeDistance);
+  const supportWeight = Math.max(
+    0,
+    Math.min(1, 1 - contactDistance / GROUND_CONTACT_TOLERANCE_PX)
+  );
+  const useAnkle = ankleIsCloser || supportWeight <= 0;
+  const contact = useAnkle ? ankle : toe;
+
+  return {
+    x: contact.x,
+    y: lockToGround ? groundY : contact.y,
+    jointId: useAnkle ? (side === 'R' ? 'footR' : 'footL') : side === 'R' ? 'toeR' : 'toeL',
+    supportWeight: lockToGround ? 1 : supportWeight,
+    worldAngle: useAnkle ? ankle.worldAngle : undefined,
+  };
+}
+
+export type WaistBalanceOptions = {
   baseRootRotation?: number;
   baseLumbarAngle?: number;
   baseThoraxAngle?: number;
@@ -2193,7 +2146,43 @@ type WaistBalanceOptions = {
   startPelvisX?: number;
   startPelvisY?: number;
   torsoCompensation?: number;
+  clampToVitruvian?: boolean;
+  startFootRPin?: GroundContactPin;
+  startFootLPin?: GroundContactPin;
 };
+
+/**
+ * Solves grounded full-body reaction when the body is translated in X/Y.
+ * In static ground mode, the ground plane stays fixed at groundY, foot contacts remain planted,
+ * and the legs and spine flex dynamically using analytical IK.
+ * Light X and Y movements are clamped to stay within the Vitruvian square and dual leg reach limits.
+ */
+export function solveGroundedBodyMotion(
+  state: ArmatureState,
+  targetPelvisX: number,
+  targetPelvisY: number,
+  groundY: number,
+  canvasOrigin: Point2D = { x: PAPER_WIDTH / 2, y: PAPER_HEIGHT / 2 },
+  options?: WaistBalanceOptions
+): ArmatureState {
+  const baseline = computeArmature(state, canvasOrigin);
+  const footRPin = options?.startFootRPin ?? getGroundContactPin(baseline.footR, baseline.toeR, groundY, 'R', true);
+  const footLPin = options?.startFootLPin ?? getGroundContactPin(baseline.footL, baseline.toeL, groundY, 'L', true);
+
+  return solveWaistBalanceHula(
+    state,
+    targetPelvisX,
+    targetPelvisY,
+    footRPin,
+    footLPin,
+    canvasOrigin,
+    {
+      ...options,
+      clampToVitruvian: true,
+      torsoCompensation: options?.torsoCompensation ?? 0.85,
+    }
+  );
+}
 
 export function solveWaistBalanceHula(
   state: ArmatureState,
@@ -2294,9 +2283,23 @@ export function solveWaistBalanceHula(
   const centerR = { x: footRPin.x - hipOffR.x, y: footRPin.y - hipOffR.y };
   const centerL = { x: footLPin.x - hipOffL.x, y: footLPin.y - hipOffL.y };
 
+  // Vitruvian Working Frame Clamping to prevent breaking the viewing window
+  const canons = computeProportionalCanons();
+  const wsHalf = canons.workingSquareHalfPx;
+  const frameMargin = 40;
+  const minBoxX = canvasOrigin.x - wsHalf + frameMargin;
+  const maxBoxX = canvasOrigin.x + wsHalf - frameMargin;
+  const minBoxY = canvasOrigin.y - wsHalf + frameMargin;
+
   // Project candidate waist position into the intersection of both rigid leg reach circles
-  let px = targetPelvisX;
-  let py = Math.min(targetPelvisY, supportCenterY - 52);
+  let px =
+    options?.clampToVitruvian !== false
+      ? Math.max(minBoxX, Math.min(maxBoxX, targetPelvisX))
+      : targetPelvisX;
+  let py = Math.min(
+    options?.clampToVitruvian !== false ? Math.max(minBoxY, targetPelvisY) : targetPelvisY,
+    supportCenterY - 52
+  );
 
   for (let pass = 0; pass < 5; pass++) {
     const dxR = px - centerR.x;
@@ -2321,6 +2324,10 @@ export function solveWaistBalanceHula(
       py = centerL.y + (dyL / dL) * minReachL;
     }
 
+    if (options?.clampToVitruvian !== false) {
+      px = Math.max(minBoxX, Math.min(maxBoxX, px));
+      py = Math.max(minBoxY, py);
+    }
     py = Math.min(py, supportCenterY - 52);
   }
 
