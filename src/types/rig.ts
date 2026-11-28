@@ -301,40 +301,19 @@ export const ANGLE_PRECISION_STEP = 0.25;
 export const BONE_SCALE_MIN = 0.5;
 export const BONE_SCALE_MAX = 2.0;
 
-// Playground Studio Extensions
-export type PlaygroundTab = 'poses' | 'timeline' | 'ik_systems' | 'digits' | 'perspective' | 'scene';
-
-export type KeyframeSlot = 'A' | 'B' | 'C';
-
-export type MotionCurve =
-  | 'flow'
-  | 'snap'
-  | 'elastic'
-  | 'mechanical'
-  | 'clockwork'
-  | 'procedural';
-
-export type GroundPlaneMode = 'static' | 'pressure';
-export type GroundReactionTrigger = 'primary' | 'all';
+/**
+ * Canonical in-memory pose state for the Base Posing Model.
+ */
+export interface PoseState {
+  preset: PosePresetId | null;
+  armature: ArmatureState;
+}
 
 export interface RigSystemsConfig {
   softLimits: boolean;
   floorSnap: boolean;
-  elasticPin: boolean;
-  antiPhallic: boolean;
   groundY: number;
   pressurePlateY?: number;
-  groundMode?: GroundPlaneMode;
-  reactionTrigger?: GroundReactionTrigger;
   solver: 'analytical' | 'fabrik' | 'ccd';
-  showSwivelsAndJoints?: boolean;
 }
 
-export type HandGesturePreset = 'open' | 'fist' | 'point' | 'pinch' | 'relaxed' | 'grasp';
-
-export interface UserSavedPose {
-  id: string;
-  name: string;
-  timestamp: number;
-  armature: ArmatureState;
-}

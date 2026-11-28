@@ -181,13 +181,55 @@
   animation: edgeRimSweepPrev 420ms steps(10, end) forwards;
 }
 
+@keyframes warningFlash {
+  0%,
+  100% {
+    color: #ff006e;
+    opacity: 1;
+    text-shadow: 0 0 10px rgba(255, 0, 110, 0.45);
+  }
+  50% {
+    color: #e11d74;
+    opacity: 0.28;
+    text-shadow: none;
+  }
+}
+
+.animate-warning-flash {
+  animation: warningFlash 0.72s ease-in-out infinite;
+}
+
+@keyframes planquetteDwellFill {
+  from {
+    transform: scaleX(0);
+  }
+  to {
+    transform: scaleX(1);
+  }
+}
+
+@keyframes planquetteArcRingFill {
+  from {
+    stroke-dashoffset: 125.66;
+  }
+  to {
+    stroke-dashoffset: 0;
+  }
+}
+
+.cursor-hidden-active,
+.cursor-hidden-active * {
+  cursor: none !important;
+}
+
 @media (prefers-reduced-motion: reduce) {
   .animate-paper-next,
   .animate-paper-prev,
   .animate-cover-next,
   .animate-cover-prev,
   .animate-edge-sweep-next,
-  .animate-edge-sweep-prev {
+  .animate-edge-sweep-prev,
+  .animate-warning-flash {
     animation: none !important;
     transition: none !important;
   }

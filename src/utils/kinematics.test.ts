@@ -8,18 +8,6 @@ import {
   REPO_GREEN_GLOW_LIGHT,
 } from '../data/digitalRig';
 import {
-  DEFAULT_SCREEN_FPS,
-  FPS_OPTIONS,
-  getFrameIntervalMs,
-  getNextFpsOption,
-  remainingScreenFrameWaitMs,
-  shouldEmitScreenFrame,
-} from './frameThrottle';
-import {
-  buildSavedPosePayload,
-  computeUncutExportViewBox,
-} from './poseExport';
-import {
   COLLAR_INWARD_BREAKAWAY_DEG,
   COLLAR_INWARD_NORMAL_LIMIT_DEG,
   COLLAR_INWARD_RESISTANCE_START_DEG,
@@ -60,7 +48,6 @@ import {
   setFaceplateOffset,
   solveWaistBalanceHula,
   interpolateArmatures,
-  synthesizeProceduralBreakdown,
   toggleArmReverseSwivel,
 } from './kinematics';
 
@@ -306,7 +293,7 @@ test('neck-collar magnet translates the connected group, clamps at neck reach, a
   assert.ok(Math.abs(computed.braceR.x - base.braceR.x - separation.x) < 1e-4);
   assert.equal(hasArmaturePoseDelta(state, separated), true);
 
-  const midpoint = interpolateArmatures(state, separated, 0.5, 'mechanical');
+  const midpoint = interpolateArmatures(state, separated, 0.5, 'linear');
   assert.ok(Math.abs(midpoint.neckCollarSeparation!.x - separation.x / 2) < 1e-4);
   assert.equal(mirrorPose(separated).neckCollarSeparation!.x, -separation.x);
   assert.deepEqual(createPosePreset('tpose', separated).neckCollarSeparation, { x: 0, y: 0 });
@@ -483,7 +470,7 @@ function hexSaturation(hex: string): number {
   return l > 0.5 ? d / (2 - max - min) : d / (max + min);
 }
 
-test('thumbs and fingers pivot at the wrist, articulate independently, selection glow is greatly desaturated, and FPS cap defaults to 24 with 12/15/24/30 cycle', () => {
+test('thumbs and fingers pivot at the wrist, articulate independently, and selection glow stays desaturated', () => {
   const pose = createPosePreset('tpose');
   pose.joints.thumbL.localAngle = -25;
   pose.joints.fingerR.localAngle = 35;
@@ -509,46 +496,9 @@ test('thumbs and fingers pivot at the wrist, articulate independently, selection
 
   assert.ok(hexSaturation(REPO_GREEN_GLOW_LIGHT) <= 0.12);
   assert.ok(hexSaturation(REPO_GREEN_GLOW_DARK) <= 0.12);
-
-  assert.equal(DEFAULT_SCREEN_FPS, 24);
-  assert.deepEqual(FPS_OPTIONS, [12, 15, 24, 30]);
-  assert.equal(getNextFpsOption(24), 30);
-  assert.equal(getNextFpsOption(30), 12);
-  assert.equal(getNextFpsOption(12), 15);
-  assert.equal(getNextFpsOption(15), 24);
-
-  assert.ok(Math.abs(getFrameIntervalMs(24) - 1000 / 24) < 1e-6);
-  assert.equal(shouldEmitScreenFrame(-1, 100, 24), true);
-  assert.equal(shouldEmitScreenFrame(100, 120, 24), false);
-  assert.equal(shouldEmitScreenFrame(100, 142, 24), true);
-  assert.equal(shouldEmitScreenFrame(100, 142, 12), false);
-  assert.equal(shouldEmitScreenFrame(100, 184, 12), true);
-  assert.equal(shouldEmitScreenFrame(100, 134, 30), true);
-  assert.ok(remainingScreenFrameWaitMs(100, 120, 24) > 20);
-  assert.equal(remainingScreenFrameWaitMs(100, 145, 24), 0);
 });
 
-test('double-click pose export payload and double-right-click model export viewBox stay uncut and unskewed', () => {
-  const pose = createPosePreset('tpose');
-  pose.joints.humerusR.localAngle = -35;
-  const computed = computeArmature(pose, { x: 681.5, y: 900 });
-  const fixedDate = new Date('2026-11-26T09:05:00.000Z');
-  const payload = buildSavedPosePayload(pose, computed, 'tpose', fixedDate);
-
-  assert.equal(payload.savedAt, '2026-11-26T09:05:00.000Z');
-  assert.equal(payload.savedDate, '2026-11-26');
-  assert.equal(payload.preset, 'tpose');
-  assert.ok(payload.joints.pelvis && Number.isFinite(payload.joints.pelvis.x));
-
-  const vb = computeUncutExportViewBox({ x: 250, y: 310, width: 920, height: 1120 }, computed, 48);
-  assert.ok(vb.x <= 202 && vb.y <= 262);
-  assert.ok(vb.x + vb.width >= 1218 && vb.y + vb.height >= 1478);
-  const aspectViewBox = vb.width / vb.height;
-  const aspectExport = vb.exportWidth / vb.exportHeight;
-  assert.ok(Math.abs(aspectViewBox - aspectExport) < 0.01, 'export dimensions must preserve aspect ratio without skew');
-});
-
-test('multi-joint IK solvers for elbows, knees, digits, and keyframe interpolation work smoothly', () => {
+test('multi-joint IK solvers for elbows, knees, digits, and smooth pose transition work cleanly', () => {
   const base = createPosePreset('tpose');
   const computed = computeArmature(base);
 
@@ -571,18 +521,15 @@ test('multi-joint IK solvers for elbows, knees, digits, and keyframe interpolati
   const solvedUniversalFoot = solveJointIK(base, 'footR', computed.footR.x + 30, computed.footR.y - 20);
   assert.notEqual(solvedUniversalFoot.joints.femurR.localAngle, base.joints.femurR.localAngle);
 
-  // Test interpolation and procedural breakdown between calibrated T-pose and posed frame
+  // Test interpolation between calibrated T-pose and posed frame
   const poseA = createPosePreset('tpose');
   const poseB = createPosePreset('tpose');
   poseB.rootRotation = 4;
   poseB.joints.humerusR.localAngle = -68;
   poseB.joints.forearmR.localAngle = 36;
-  const half = interpolateArmatures(poseA, poseB, 0.5, 'flow');
+  const half = interpolateArmatures(poseA, poseB, 0.5, 'smooth');
   assert.ok(Number.isFinite(half.rootRotation));
   assert.ok(Math.abs(half.joints.humerusR.localAngle - (poseA.joints.humerusR.localAngle + poseB.joints.humerusR.localAngle) / 2) < 15);
-
-  const breakdown = synthesizeProceduralBreakdown(poseA, poseB);
-  assert.ok(Number.isFinite(breakdown.rootY));
 });
 
 test('hip bones act as anatomical thigh extensions during leg swings without breaking static clamps', () => {
@@ -922,7 +869,7 @@ test('per-arm reverse swivel flips arm orientation smoothly, reverses IK elbow b
   const midSwivel = setArmReverseSwivel(base, 'R', 90);
   const midComp = computeArmature(midSwivel);
   assert.ok(Math.abs(midComp.humerusR.armReverseFactor ?? 1) < 1e-4);
-  const tween = interpolateArmatures(base, reversed, 0.5, 'mechanical');
+  const tween = interpolateArmatures(base, reversed, 0.5, 'linear');
   assert.ok(Math.abs(Math.abs(tween.armSwivelR ?? 0) - 90) < 1e-4);
   assert.ok(Math.abs(computeArmature(tween).humerusR.armReverseFactor ?? 1) < 1e-4);
 
@@ -950,18 +897,18 @@ test('pose & toggle transition interpolation detects deltas, blends scales, and 
   assert.equal(hasArmaturePoseDelta(poseA, createPosePreset('tpose')), false);
   assert.equal(hasArmaturePoseDelta(poseA, poseB), true);
 
-  const startFrame = computePoseTransitionFrame(poseA, poseB, 0, 320, 'flow');
+  const startFrame = computePoseTransitionFrame(poseA, poseB, 0, 320, 'smooth');
   assert.equal(startFrame.done, false);
   assert.equal(startFrame.progress, 0);
   assert.equal(startFrame.armature.joints.humerusR.scaleLength, 1);
 
-  const midFrame = computePoseTransitionFrame(poseA, poseB, 160, 320, 'mechanical');
+  const midFrame = computePoseTransitionFrame(poseA, poseB, 160, 320, 'linear');
   assert.equal(midFrame.done, false);
   assert.equal(midFrame.progress, 0.5);
   assert.ok(Math.abs(midFrame.armature.joints.humerusR.scaleLength - 1.2) < 1e-4);
   assert.ok(Math.abs(midFrame.armature.joints.humerusR.scaleWidth - 1.1) < 1e-4);
 
-  const endFrame = computePoseTransitionFrame(poseA, poseB, 400, 320, 'flow');
+  const endFrame = computePoseTransitionFrame(poseA, poseB, 400, 320, 'smooth');
   assert.equal(endFrame.done, true);
   assert.equal(endFrame.progress, 1);
   assert.equal(endFrame.armature, poseB);
@@ -970,7 +917,7 @@ test('pose & toggle transition interpolation detects deltas, blends scales, and 
   const hipA = setHipToggleState(createPosePreset('tpose'), 'A');
   const hipV = setHipToggleState(createPosePreset('tpose'), 'V');
   assert.equal(hasArmaturePoseDelta(hipA, hipV), true);
-  const hipMid = interpolateArmatures(hipA, hipV, 0.5, 'mechanical');
+  const hipMid = interpolateArmatures(hipA, hipV, 0.5, 'linear');
   assert.ok(Math.abs(hipMid.joints.hipR.localAngle - 20.8) < 1e-3);
   assert.ok(Math.abs(hipMid.joints.hipL.localAngle - -20.8) < 1e-3);
 });
@@ -1000,7 +947,7 @@ test('sampled compound-pose interpolation keeps rig geometry finite and continuo
 
   for (let frameIndex = 0; frameIndex <= 20; frameIndex++) {
     const elapsedMs = (320 * frameIndex) / 20;
-    const frame = computePoseTransitionFrame(from, to, elapsedMs, 320, 'flow');
+    const frame = computePoseTransitionFrame(from, to, elapsedMs, 320, 'smooth');
     const computed = computeArmature(frame.armature, origin);
     const geometry = buildCaveArtGeometry(computed);
 

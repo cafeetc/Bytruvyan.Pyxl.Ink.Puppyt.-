@@ -1,6 +1,10 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { JOINT_SPEC_MAP, REPO_DARKEST_PURPLE, REPO_STRAIN_CRIMSON } from '../data/digitalRig';
-import { GridConfig, PageId, TurnDirection } from '../types/canvas';
+import { JOINT_SPEC_MAP, REPO_STRAIN_CRIMSON } from '../data/digitalRig';
+import {
+  GROUND_CONTACT_TOLERANCE_PX,
+  getGroundContactPin,
+} from '../engine/PoseEngine';
+import { GridConfig, PageId } from '../types/canvas';
 import {
   ArmatureState,
   ComputedJoint,
@@ -10,44 +14,29 @@ import {
   RigSystemsConfig,
 } from '../types/rig';
 import {
-  CompositeFilter,
-  SceneMedia,
-  StageTransform,
-  WorldPin,
-} from '../types/scene';
-import {
-  applyCollarSwivelDragInput,
-  applyJointAngleConstraint,
   DEFAULT_TOGGLE_TRANSITION_MS,
   FaceplateLookCollarHold,
-  getPhysicsMultiplier,
   HIP_BRIDGE_LINK_STAGE_PX,
+  applyCollarSwivelDragInput,
+  applyJointAngleConstraint,
+  computeArmature,
+  getPhysicsMultiplier,
   normalizeAngleDeg,
   setArmReverseSwivel,
   setJointMode,
+  setNeckCollarSeparation,
   shortestAngleDelta,
   solveCollarToggleFromTarget,
+  solveFaceplateLookIK,
   solveHipToggleFromTarget,
   solveJointIK,
-  solveFaceplateLookIK,
+  solvePlanquetteArmReach,
   solvePressurePlateContact,
   solveToggleHinge2Link,
   solveTorsoBalance,
   solveWaistBalanceHula,
-  setNeckCollarSeparation,
   toggleArmReverseSwivel,
 } from '../utils/kinematics';
-import {
-  DEFAULT_COMPOSITE_FILTER,
-  DEFAULT_SCENE_DURATION_SEC,
-  DEFAULT_STAGE_TRANSFORM,
-  buildStageSvgTransform,
-  computeMediaPlateBox,
-  createDefaultSceneMedia,
-  mediaToWorld,
-  resolveVideoTimeForTimeline,
-  worldToMedia,
-} from '../utils/scene';
 import {
   MEGAPYXL_PX,
   PAPER_HEIGHT,
@@ -56,25 +45,16 @@ import {
   REPOSITORY_ASSET_PATHS,
   SUBPYXL_PX,
   computeProportionalCanons,
-  computeSymmetricalBorderLayout,
   computeSymmetricalFitZoom,
-  computeSymmetricalRulerTicks,
   getPageMetadata,
 } from '../utils/proportions';
-import {
-  ScreenFpsOption,
-  remainingScreenFrameWaitMs,
-  shouldEmitScreenFrame,
-} from '../utils/frameThrottle';
-import { saveTransparentModelImage } from '../utils/poseExport';
 import { DigitalMannequin } from './DigitalMannequin';
 import { ScanBorderLayer } from './ScanBorderLayer';
 
-interface BookStageCanvasProps {
+export interface BookStageCanvasProps {
   pageId: PageId;
   grid: GridConfig;
   darkMode: boolean;
-  screenFps: ScreenFpsOption;
   zoom: number;
   pan: { x: number; y: number };
   armature: ArmatureState;
@@ -83,51 +63,46 @@ interface BookStageCanvasProps {
   onZoomChange: (nextZoom: number) => void;
   onPanChange: (nextPan: { x: number; y: number }) => void;
   onViewportResize: (size: { width: number; height: number }) => void;
-  onCursorMove: (coords: { x: number; y: number } | null) => void;
-  onTurnPage: (target: PageId, direction: TurnDirection) => void;
-  onFitRequest: () => void;
-  onCopyPoseData: () => Promise<unknown> | void;
-  onSavePoseData: () => void;
+  onCursorMove?: (coords: { x: number; y: number } | null) => void;
   onSelectJoint: (id: JointId) => void;
   onUpdateArmature: (next: ArmatureState) => void;
   onAnimateArmature?: (next: ArmatureState, durationMs?: number) => void;
   isPoseTransitioning?: boolean;
-  isPlaying?: boolean;
   onCommitPoseHistory: () => void;
-  rigSystems?: RigSystemsConfig;
-  onUpdateRigSystems?: (patch: Partial<RigSystemsConfig>) => void;
-  showPerspective?: boolean;
-  vanishingPoint?: { x: number; y: number };
-  onVanishingPointChange?: (vp: { x: number; y: number }) => void;
-  sceneMedia?: SceneMedia;
-  stageTransform?: StageTransform;
-  compositeFilter?: CompositeFilter;
-  worldPins?: WorldPin[];
-  timelineT?: number;
-  sceneDurationSec?: number;
-  showCalibrationOrigin?: boolean;
-  onUpdateStageTransform?: (patch: Partial<StageTransform>) => void;
-  onUpdateWorldPin?: (pinId: string, mediaSpaceXY: { x: number; y: number }) => void;
+  rigSystems: RigSystemsConfig;
+  onUpdateRigSystems: (patch: Partial<RigSystemsConfig>) => void;
+  worldOverlay?: React.ReactNode;
+  planquetteReachActive?: boolean;
+  onFaceplateDragChange?: (isDragging: boolean) => void;
+  onFaceplateDragMove?: (drag: { pointer: Point2D; target: Point2D }) => void;
+  onPlanquetteDragChange?: (info: {
+    isDragging: boolean;
+    source: 'faceplate' | 'handR' | 'handL' | null;
+  }) => void;
+  onPlanquetteDragMove?: (info: {
+    source: 'faceplate' | 'handR' | 'handL';
+    effectorJointId: 'lip' | 'handR' | 'handL' | 'fingerTipR' | 'fingerTipL';
+    effectorWorld: Point2D;
+    headWorld?: Point2D;
+    lipWorld?: Point2D;
+    pointerWorld: Point2D;
+    pointerScreen: Point2D;
+  }) => void;
+  onDragEnd?: () => void;
 }
 
-const INK_STRENGTH_OPACITY = {
-  whisper: { sub: 0.04, pyxl: 0.095, mega: 0.19, axis: 0.26, guide: 0.24 },
-  light: { sub: 0.065, pyxl: 0.145, mega: 0.28, axis: 0.36, guide: 0.34 },
-  draft: { sub: 0.105, pyxl: 0.22, mega: 0.40, axis: 0.50, guide: 0.46 },
+const LIGHT_INK_OPACITY = {
+  sub: 0.065,
+  pyxl: 0.145,
+  mega: 0.28,
+  axis: 0.36,
+  guide: 0.34,
 } as const;
 
 const EIGHT_HEAD_INDICES = [0, 1, 2, 3, 4, 5, 6, 7, 8] as const;
 const MAX_ZOOM = 2.4;
-const PERSPECTIVE_RAY_VECTORS = Array.from({ length: 16 }, (_, idx) => {
-  const angle = (idx / 16) * Math.PI * 2;
-  return { idx, dx: Math.cos(angle) * 2800, dy: Math.sin(angle) * 2800 };
-});
 
-function getFigureBounds(
-  joints: Record<JointId, ComputedJoint>,
-  transform: StageTransform,
-  origin: Point2D
-) {
+function getFigureBounds(joints: Record<JointId, ComputedJoint>) {
   const bounds = {
     minX: Number.POSITIVE_INFINITY,
     minY: Number.POSITIVE_INFINITY,
@@ -135,46 +110,12 @@ function getFigureBounds(
     maxY: Number.NEGATIVE_INFINITY,
   };
   for (const joint of Object.values(joints)) {
-    for (const point of [
-      { x: joint.x, y: joint.y },
-      { x: joint.endX, y: joint.endY },
-    ]) {
-      const screenWorldPoint = mediaToWorld(point, transform, origin);
-      bounds.minX = Math.min(bounds.minX, screenWorldPoint.x);
-      bounds.minY = Math.min(bounds.minY, screenWorldPoint.y);
-      bounds.maxX = Math.max(bounds.maxX, screenWorldPoint.x);
-      bounds.maxY = Math.max(bounds.maxY, screenWorldPoint.y);
-    }
+    bounds.minX = Math.min(bounds.minX, joint.x, joint.endX);
+    bounds.minY = Math.min(bounds.minY, joint.y, joint.endY);
+    bounds.maxX = Math.max(bounds.maxX, joint.x, joint.endX);
+    bounds.maxY = Math.max(bounds.maxY, joint.y, joint.endY);
   }
   return bounds;
-}
-
-const GROUND_CONTACT_TOLERANCE_PX = 12;
-
-function getGroundContactPin(
-  ankle: ComputedJoint,
-  toe: ComputedJoint,
-  groundY: number,
-  side: 'R' | 'L'
-): GroundContactPin {
-  const ankleDistance = Math.abs(groundY - ankle.y);
-  const toeDistance = Math.abs(groundY - toe.y);
-  const ankleIsCloser = ankleDistance <= toeDistance;
-  const contactDistance = Math.min(ankleDistance, toeDistance);
-  const supportWeight = Math.max(
-    0,
-    Math.min(1, 1 - contactDistance / GROUND_CONTACT_TOLERANCE_PX)
-  );
-  const useAnkle = ankleIsCloser || supportWeight <= 0;
-  const contact = useAnkle ? ankle : toe;
-
-  return {
-    x: contact.x,
-    y: contact.y,
-    jointId: useAnkle ? (side === 'R' ? 'footR' : 'footL') : side === 'R' ? 'toeR' : 'toeL',
-    supportWeight,
-    worldAngle: useAnkle ? ankle.worldAngle : undefined,
-  };
 }
 
 type ActiveDragState =
@@ -186,13 +127,9 @@ type ActiveDragState =
       startPanY: number;
     }
   | {
-      type: 'root_translate';
-      offsetX: number;
-      offsetY: number;
-    }
-  | {
       type: 'ik';
       jointId: JointId;
+      startArmature?: ArmatureState;
       offsetX: number;
       offsetY: number;
     }
@@ -220,29 +157,6 @@ type ActiveDragState =
       pivotY: number;
       lastCursorDeg: number | null;
       rawAngle: number;
-      startPelvis?: Point2D;
-      startRootRotation?: number;
-      startLumbarAngle?: number;
-      startThoraxAngle?: number;
-      startNeckAngle?: number;
-      footRPin?: GroundContactPin;
-      footLPin?: GroundContactPin;
-    }
-  | {
-      type: 'vanishing_point';
-      offsetX: number;
-      offsetY: number;
-    }
-  | {
-      type: 'stage_origin';
-      offsetX: number;
-      offsetY: number;
-    }
-  | {
-      type: 'world_pin';
-      pinId: string;
-      offsetX: number;
-      offsetY: number;
     }
   | {
       type: 'waist_balance';
@@ -292,7 +206,6 @@ export const BookStageCanvas: React.FC<BookStageCanvasProps> = React.memo(({
   pageId,
   grid,
   darkMode,
-  screenFps,
   zoom,
   pan,
   armature,
@@ -302,47 +215,28 @@ export const BookStageCanvas: React.FC<BookStageCanvasProps> = React.memo(({
   onPanChange,
   onViewportResize,
   onCursorMove,
-  onTurnPage,
-  onFitRequest,
-  onCopyPoseData,
-  onSavePoseData,
   onSelectJoint,
   onUpdateArmature,
   onAnimateArmature,
   isPoseTransitioning = false,
-  isPlaying = false,
   onCommitPoseHistory,
   rigSystems,
   onUpdateRigSystems,
-  showPerspective = false,
-  vanishingPoint,
-  onVanishingPointChange,
-  sceneMedia,
-  stageTransform,
-  compositeFilter,
-  worldPins = [],
-  timelineT = 0,
-  sceneDurationSec = DEFAULT_SCENE_DURATION_SEC,
-  showCalibrationOrigin = false,
-  onUpdateStageTransform,
-  onUpdateWorldPin,
+  worldOverlay,
+  planquetteReachActive = false,
+  onFaceplateDragChange,
+  onFaceplateDragMove,
+  onPlanquetteDragChange,
+  onPlanquetteDragMove,
+  onDragEnd,
 }) => {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const svgRef = useRef<SVGSVGElement | null>(null);
-  const videoRef = useRef<HTMLVideoElement | null>(null);
   const [viewportSize, setViewportSize] = useState({ width: 1440, height: 820 });
   const [dragState, setDragState] = useState<ActiveDragState | null>(null);
   const dragRef = useRef<ActiveDragState | null>(null);
   const [isGroundLineHovered, setIsGroundLineHovered] = useState(false);
-
-  const effectiveMedia = useMemo(
-    () => sceneMedia ?? createDefaultSceneMedia(),
-    [sceneMedia]
-  );
-  const effectiveTransform = stageTransform ?? DEFAULT_STAGE_TRANSFORM;
-  const effectiveFilter = compositeFilter ?? DEFAULT_COMPOSITE_FILTER;
-  const stageTransformRef = useRef(effectiveTransform);
-  stageTransformRef.current = effectiveTransform;
+  const [activePlusWorld, setActivePlusWorld] = useState<Point2D | null>(null);
 
   const armatureRef = useRef(armature);
   armatureRef.current = armature;
@@ -352,14 +246,6 @@ export const BookStageCanvas: React.FC<BookStageCanvasProps> = React.memo(({
   panRef.current = pan;
   const zoomRef = useRef(zoom);
   zoomRef.current = zoom;
-  const screenFpsRef = useRef<ScreenFpsOption>(screenFps);
-  screenFpsRef.current = screenFps;
-  const lastRightClickRef = useRef<{ time: number; x: number; y: number } | null>(null);
-  const rightClickTimerRef = useRef<number | null>(null);
-  const lastLeftClickRef = useRef<{ time: number; x: number; y: number; count: number } | null>(null);
-  const leftClickTimerRef = useRef<number | null>(null);
-  const pointerDownPosRef = useRef<{ x: number; y: number } | null>(null);
-  const [lastExportKind, setLastExportKind] = useState<'none' | 'clipboard' | 'pose' | 'png'>('none');
 
   const pendingUpdateRef = useRef<{
     hasCursor?: boolean;
@@ -368,76 +254,44 @@ export const BookStageCanvas: React.FC<BookStageCanvasProps> = React.memo(({
     zoom?: number;
     armature?: ArmatureState;
   }>({});
-  const lastScreenEmitMsRef = useRef<number>(-1);
-  const screenTimerRef = useRef<number | null>(null);
+  const flushFrameRef = useRef<number | null>(null);
   const pendingPointerMoveRef = useRef<{ clientX: number; clientY: number } | null>(null);
   const pointerMoveFrameRef = useRef<number | null>(null);
 
-  const [turnAnim, setTurnAnim] = useState<{
-    key: number;
-    direction: TurnDirection;
-    fromPage: PageId;
-    fromSubstrate: 'cover' | 'paper';
-    toSubstrate: 'cover' | 'paper';
-  } | null>(null);
-  const prevPageRef = useRef<PageId>(pageId);
-  const lastRequestedDirRef = useRef<TurnDirection>('next');
-  const turnCounterRef = useRef(0);
-
   const meta = getPageMetadata(pageId);
   const isCover = meta.substrate === 'cover';
-  // Back Cover (Page 22) hosts all circles, squares, light ink grids, rulers & procedural digital bones;
-  // Soft Paper (Page 21) stays kept in the back as a clean backing paper leaf.
-  const showCoverWorkspace = isCover;
-  void onTurnPage;
-  void onFitRequest;
 
-  const flushScreenFrame = useCallback(
-    (force = false) => {
-      if (screenTimerRef.current !== null) {
-        window.clearTimeout(screenTimerRef.current);
-        screenTimerRef.current = null;
-      }
-      const now = performance.now();
-      const fps = screenFpsRef.current;
-      if (!force && !shouldEmitScreenFrame(lastScreenEmitMsRef.current, now, fps)) {
-        const waitMs = remainingScreenFrameWaitMs(lastScreenEmitMsRef.current, now, fps);
-        screenTimerRef.current = window.setTimeout(() => {
-          screenTimerRef.current = null;
-          flushScreenFrame(false);
-        }, waitMs);
-        return;
-      }
+  const flushUpdates = useCallback(() => {
+    if (flushFrameRef.current !== null) {
+      window.cancelAnimationFrame(flushFrameRef.current);
+      flushFrameRef.current = null;
+    }
+    const pending = pendingUpdateRef.current;
+    if (
+      !pending.hasCursor &&
+      pending.pan === undefined &&
+      pending.zoom === undefined &&
+      pending.armature === undefined
+    ) {
+      return;
+    }
+    pendingUpdateRef.current = {};
 
-      const pending = pendingUpdateRef.current;
-      if (
-        !pending.hasCursor &&
-        pending.pan === undefined &&
-        pending.zoom === undefined &&
-        pending.armature === undefined
-      ) {
-        return;
-      }
-      pendingUpdateRef.current = {};
-      lastScreenEmitMsRef.current = now;
+    if (pending.hasCursor) {
+      onCursorMove?.(pending.cursor ?? null);
+    }
+    if (pending.zoom !== undefined) {
+      onZoomChange(pending.zoom);
+    }
+    if (pending.pan !== undefined) {
+      onPanChange(pending.pan);
+    }
+    if (pending.armature !== undefined) {
+      onUpdateArmature(pending.armature);
+    }
+  }, [onCursorMove, onPanChange, onUpdateArmature, onZoomChange]);
 
-      if (pending.hasCursor) {
-        onCursorMove(pending.cursor ?? null);
-      }
-      if (pending.zoom !== undefined) {
-        onZoomChange(pending.zoom);
-      }
-      if (pending.pan !== undefined) {
-        onPanChange(pending.pan);
-      }
-      if (pending.armature !== undefined) {
-        onUpdateArmature(pending.armature);
-      }
-    },
-    [onCursorMove, onPanChange, onUpdateArmature, onZoomChange]
-  );
-
-  const enqueueScreenUpdate = useCallback(
+  const enqueueUpdate = useCallback(
     (patch: {
       hasCursor?: boolean;
       cursor?: { x: number; y: number } | null;
@@ -449,33 +303,20 @@ export const BookStageCanvas: React.FC<BookStageCanvasProps> = React.memo(({
         ...pendingUpdateRef.current,
         ...patch,
       };
-      if (screenTimerRef.current !== null) {
-        return;
-      }
-      const now = performance.now();
-      const fps = screenFpsRef.current;
-      if (shouldEmitScreenFrame(lastScreenEmitMsRef.current, now, fps)) {
-        flushScreenFrame(false);
-      } else {
-        const waitMs = remainingScreenFrameWaitMs(lastScreenEmitMsRef.current, now, fps);
-        screenTimerRef.current = window.setTimeout(() => {
-          screenTimerRef.current = null;
-          flushScreenFrame(false);
-        }, waitMs);
-      }
+      if (flushFrameRef.current !== null) return;
+      flushFrameRef.current = window.requestAnimationFrame(() => {
+        flushFrameRef.current = null;
+        flushUpdates();
+      });
     },
-    [flushScreenFrame]
+    [flushUpdates]
   );
 
   useEffect(() => {
     return () => {
-      if (screenTimerRef.current !== null) {
-        window.clearTimeout(screenTimerRef.current);
-        screenTimerRef.current = null;
-      }
-      if (leftClickTimerRef.current !== null) {
-        window.clearTimeout(leftClickTimerRef.current);
-        leftClickTimerRef.current = null;
+      if (flushFrameRef.current !== null) {
+        window.cancelAnimationFrame(flushFrameRef.current);
+        flushFrameRef.current = null;
       }
       if (pointerMoveFrameRef.current !== null) {
         window.cancelAnimationFrame(pointerMoveFrameRef.current);
@@ -502,73 +343,9 @@ export const BookStageCanvas: React.FC<BookStageCanvasProps> = React.memo(({
     return () => ro.disconnect();
   }, [onViewportResize]);
 
-  useEffect(() => {
-    const prevPage = prevPageRef.current;
-    if (prevPage === pageId) return;
-    const prevMeta = getPageMetadata(prevPage);
-    const currMeta = getPageMetadata(pageId);
-
-    turnCounterRef.current += 1;
-    setTurnAnim({
-      key: turnCounterRef.current,
-      direction: lastRequestedDirRef.current,
-      fromPage: prevPage,
-      fromSubstrate: prevMeta.substrate,
-      toSubstrate: currMeta.substrate,
-    });
-    prevPageRef.current = pageId;
-
-    const timer = window.setTimeout(() => {
-      setTurnAnim(null);
-    }, 480);
-    return () => window.clearTimeout(timer);
-  }, [pageId]);
-
-  const borderLayout = useMemo(
-    () => computeSymmetricalBorderLayout(viewportSize.width, viewportSize.height),
-    [viewportSize.width, viewportSize.height]
-  );
-
   const canons = useMemo(() => computeProportionalCanons(), []);
   const originOffset = useMemo(() => ({ x: PAPER_WIDTH / 2, y: PAPER_HEIGHT / 2 }), []);
-  const figureBounds = useMemo(
-    () => getFigureBounds(computedJoints, effectiveTransform, originOffset),
-    [computedJoints, effectiveTransform, originOffset]
-  );
-  const mediaPlateBox = useMemo(
-    () => computeMediaPlateBox(effectiveMedia, originOffset),
-    [effectiveMedia, originOffset]
-  );
-
-  // Keep <video> backdrop plate synchronized to BottomAnimationDrawer scrub / cutout FPS
-  useEffect(() => {
-    if (effectiveMedia.kind !== 'video') return;
-    const vid = videoRef.current;
-    if (!vid) return;
-    const targetSec = resolveVideoTimeForTimeline(
-      timelineT,
-      sceneDurationSec,
-      effectiveMedia.duration || sceneDurationSec,
-      effectiveMedia.fps,
-      effectiveMedia.loop,
-      effectiveMedia.playbackOffset
-    );
-    if (Math.abs((vid.currentTime || 0) - targetSec) > 0.02) {
-      try {
-        vid.currentTime = targetSec;
-      } catch {
-        // Video metadata not ready yet
-      }
-    }
-  }, [
-    effectiveMedia.duration,
-    effectiveMedia.fps,
-    effectiveMedia.kind,
-    effectiveMedia.loop,
-    effectiveMedia.playbackOffset,
-    sceneDurationSec,
-    timelineT,
-  ]);
+  const figureBounds = useMemo(() => getFigureBounds(computedJoints), [computedJoints]);
 
   const endlessBounds = useMemo(() => {
     const overscan = Math.max(2200, 1600 / Math.max(0.1, zoom));
@@ -586,46 +363,9 @@ export const BookStageCanvas: React.FC<BookStageCanvasProps> = React.memo(({
     };
   }, [pan.x, pan.y, zoom, viewportSize.width, viewportSize.height]);
 
-  const rulerTicks = useMemo(() => {
-    const edgeMargin = Math.max(46, borderLayout.cornerSize + 18);
-    return {
-      xTicks: computeSymmetricalRulerTicks(
-        viewportSize.width,
-        pan.x,
-        zoom,
-        originOffset.x + effectiveTransform.originX,
-        edgeMargin,
-        edgeMargin,
-        44
-      ),
-      yTicks: computeSymmetricalRulerTicks(
-        viewportSize.height,
-        pan.y,
-        zoom,
-        originOffset.y + effectiveTransform.originY,
-        edgeMargin,
-        edgeMargin,
-        24
-      ),
-    };
-  }, [
-    borderLayout.cornerSize,
-    effectiveTransform.originX,
-    effectiveTransform.originY,
-    originOffset.x,
-    originOffset.y,
-    pan.x,
-    pan.y,
-    viewportSize.height,
-    viewportSize.width,
-    zoom,
-  ]);
-
-  const inkOpacity = INK_STRENGTH_OPACITY[grid.inkStrength];
   const subpyxlZoomOpacity = zoom < 0.25 ? 0.22 : zoom < 0.5 ? 0.55 : 1.0;
 
-  // Uncalibrated SVG stage/media world coordinates
-  const clientToSvgWorld = useCallback(
+  const clientToRigWorld = useCallback(
     (clientX: number, clientY: number) => {
       const rect = svgRef.current?.getBoundingClientRect();
       if (!rect) return { x: originOffset.x, y: originOffset.y };
@@ -639,14 +379,11 @@ export const BookStageCanvas: React.FC<BookStageCanvasProps> = React.memo(({
     [originOffset.x, originOffset.y]
   );
 
-  // Calibrated rig world coordinates (inverse StageTransform so IK/FK dragging matches cursor!)
-  const clientToRigWorld = useCallback(
-    (clientX: number, clientY: number) => {
-      const mediaWorld = clientToSvgWorld(clientX, clientY);
-      return worldToMedia(mediaWorld, stageTransformRef.current, originOffset);
-    },
-    [clientToSvgWorld, originOffset]
-  );
+  const clientToScreenLocal = useCallback((clientX: number, clientY: number): Point2D => {
+    const rect = svgRef.current?.getBoundingClientRect();
+    if (!rect) return { x: clientX, y: clientY };
+    return { x: clientX - rect.left, y: clientY - rect.top };
+  }, []);
 
   const handleWheel = useCallback(
     (e: WheelEvent) => {
@@ -690,9 +427,9 @@ export const BookStageCanvas: React.FC<BookStageCanvasProps> = React.memo(({
       };
       zoomRef.current = nextZoom;
       panRef.current = nextPan;
-      enqueueScreenUpdate({ zoom: nextZoom, pan: nextPan });
+      enqueueUpdate({ zoom: nextZoom, pan: nextPan });
     },
-    [enqueueScreenUpdate, figureBounds, viewportSize.height, viewportSize.width]
+    [enqueueUpdate, figureBounds, viewportSize.height, viewportSize.width]
   );
 
   useEffect(() => {
@@ -743,12 +480,6 @@ export const BookStageCanvas: React.FC<BookStageCanvasProps> = React.memo(({
       const lastCursorDeg =
         dist >= 4 ? (Math.atan2(world.y - pivot.y, world.x - pivot.x) * 180) / Math.PI : null;
       const rawAngle = targetJointId === 'pelvis' ? curArmature.rootRotation : runtime.localAngle;
-      const joints = computedJointsRef.current;
-      const groundY =
-        rigSystems?.pressurePlateY ??
-        rigSystems?.groundY ??
-        originOffset.y + canons.eightHeadTotalPx / 2;
-      const isLoinPivot = targetJointId === 'hipR' || targetJointId === 'hipL';
       safeSetPointerCapture(e.pointerId);
       setActiveDrag({
         type: 'fk_rotate',
@@ -757,28 +488,9 @@ export const BookStageCanvas: React.FC<BookStageCanvasProps> = React.memo(({
         pivotY: pivot.y,
         lastCursorDeg,
         rawAngle,
-        ...(isLoinPivot
-          ? {
-              startPelvis: { x: joints.pelvis.x, y: joints.pelvis.y },
-              startRootRotation: curArmature.rootRotation,
-              startLumbarAngle: curArmature.joints.lumbar.localAngle,
-              startThoraxAngle: curArmature.joints.thorax.localAngle,
-              startNeckAngle: curArmature.joints.neck.localAngle,
-              footRPin: getGroundContactPin(joints.footR, joints.toeR, groundY, 'R'),
-              footLPin: getGroundContactPin(joints.footL, joints.toeL, groundY, 'L'),
-            }
-          : {}),
       });
     },
-    [
-      canons.eightHeadTotalPx,
-      clientToRigWorld,
-      originOffset.y,
-      rigSystems?.groundY,
-      rigSystems?.pressurePlateY,
-      safeSetPointerCapture,
-      setActiveDrag,
-    ]
+    [clientToRigWorld, safeSetPointerCapture, setActiveDrag]
   );
 
   const beginFaceplateLookDrag = useCallback(
@@ -790,6 +502,7 @@ export const BookStageCanvas: React.FC<BookStageCanvasProps> = React.memo(({
       if (!runtime || runtime.mode === 'PIN' || runtime.physicsMode === 'rigid') return;
 
       const world = clientToRigWorld(e.clientX, e.clientY);
+      const screen = clientToScreenLocal(e.clientX, e.clientY);
       const faceplate = computedJointsRef.current.lip;
       const startArmature = setJointMode(curArmature, 'lip', 'IK');
       armatureRef.current = startArmature;
@@ -800,11 +513,30 @@ export const BookStageCanvas: React.FC<BookStageCanvasProps> = React.memo(({
         offsetX: faceplate.x - world.x,
         offsetY: faceplate.y - world.y,
       });
-      enqueueScreenUpdate({ armature: startArmature });
+      setActivePlusWorld(world);
+      onFaceplateDragChange?.(true);
+      onFaceplateDragMove?.({ pointer: world, target: faceplate });
+      onPlanquetteDragChange?.({ isDragging: true, source: 'faceplate' });
+      const headJoint = computedJointsRef.current.head;
+      onPlanquetteDragMove?.({
+        source: 'faceplate',
+        effectorJointId: 'lip',
+        effectorWorld: { x: faceplate.x, y: faceplate.y },
+        headWorld: { x: headJoint.x, y: headJoint.y },
+        lipWorld: { x: faceplate.x, y: faceplate.y },
+        pointerWorld: world,
+        pointerScreen: screen,
+      });
+      enqueueUpdate({ armature: startArmature });
     },
     [
       clientToRigWorld,
-      enqueueScreenUpdate,
+      clientToScreenLocal,
+      enqueueUpdate,
+      onFaceplateDragChange,
+      onFaceplateDragMove,
+      onPlanquetteDragChange,
+      onPlanquetteDragMove,
       onSelectJoint,
       safeSetPointerCapture,
       setActiveDrag,
@@ -850,10 +582,7 @@ export const BookStageCanvas: React.FC<BookStageCanvasProps> = React.memo(({
       const world = clientToRigWorld(e.clientX, e.clientY);
       const joints = computedJointsRef.current;
       const pelvis = joints.pelvis;
-      const groundY =
-        rigSystems?.pressurePlateY ??
-        rigSystems?.groundY ??
-        originOffset.y + canons.eightHeadTotalPx / 2;
+      const groundY = rigSystems.pressurePlateY ?? rigSystems.groundY;
       safeSetPointerCapture(e.pointerId);
       setActiveDrag({
         type: 'waist_balance',
@@ -869,11 +598,9 @@ export const BookStageCanvas: React.FC<BookStageCanvasProps> = React.memo(({
       });
     },
     [
-      canons.eightHeadTotalPx,
       clientToRigWorld,
-      originOffset.y,
-      rigSystems?.groundY,
-      rigSystems?.pressurePlateY,
+      rigSystems.groundY,
+      rigSystems.pressurePlateY,
       safeSetPointerCapture,
       setActiveDrag,
     ]
@@ -889,10 +616,7 @@ export const BookStageCanvas: React.FC<BookStageCanvasProps> = React.memo(({
       onSelectJoint('lumbar');
       const world = clientToRigWorld(e.clientX, e.clientY);
       const joints = computedJointsRef.current;
-      const groundY =
-        rigSystems?.pressurePlateY ??
-        rigSystems?.groundY ??
-        originOffset.y + canons.eightHeadTotalPx / 2;
+      const groundY = rigSystems.pressurePlateY ?? rigSystems.groundY;
       safeSetPointerCapture(e.pointerId);
       setActiveDrag({
         type: 'torso_balance',
@@ -907,7 +631,14 @@ export const BookStageCanvas: React.FC<BookStageCanvasProps> = React.memo(({
         offsetY: torsoCenter.y - world.y,
       });
     },
-    [clientToRigWorld, onSelectJoint, safeSetPointerCapture, setActiveDrag]
+    [
+      clientToRigWorld,
+      onSelectJoint,
+      rigSystems.groundY,
+      rigSystems.pressurePlateY,
+      safeSetPointerCapture,
+      setActiveDrag,
+    ]
   );
 
   const beginPressurePlateDrag = useCallback(
@@ -915,7 +646,7 @@ export const BookStageCanvas: React.FC<BookStageCanvasProps> = React.memo(({
       e.stopPropagation();
       const joints = computedJointsRef.current;
       const pressureY =
-        rigSystems?.pressurePlateY ??
+        rigSystems.pressurePlateY ??
         Math.max(joints.footR.y, joints.toeR.y, joints.footL.y, joints.toeL.y);
       const world = clientToRigWorld(e.clientX, e.clientY);
       safeSetPointerCapture(e.pointerId);
@@ -925,7 +656,7 @@ export const BookStageCanvas: React.FC<BookStageCanvasProps> = React.memo(({
         offsetY: pressureY - world.y,
       });
     },
-    [clientToRigWorld, rigSystems?.pressurePlateY, safeSetPointerCapture, setActiveDrag]
+    [clientToRigWorld, rigSystems.pressurePlateY, safeSetPointerCapture, setActiveDrag]
   );
 
   const handlePointerDownHipToggle = useCallback(
@@ -987,14 +718,11 @@ export const BookStageCanvas: React.FC<BookStageCanvasProps> = React.memo(({
       }
       e.stopPropagation();
       onSelectJoint(jointId);
-      if (jointId === 'handR' || jointId === 'handL') {
-        startCumulativeFKRotate(e, jointId);
-        return;
-      }
       const curArmature = armatureRef.current;
       const joint = computedJointsRef.current[jointId];
       const spec = JOINT_SPEC_MAP[jointId];
       const world = clientToRigWorld(e.clientX, e.clientY);
+      const screen = clientToScreenLocal(e.clientX, e.clientY);
 
       if (joint.mode === 'ROOT' || jointId === 'pelvis') {
         beginWaistBalanceDrag(e);
@@ -1015,15 +743,60 @@ export const BookStageCanvas: React.FC<BookStageCanvasProps> = React.memo(({
         return;
       }
 
+      // Finger or fingertip guides the whole arm via tip IK
+      if (
+        jointId === 'fingerTipR' ||
+        jointId === 'fingerR' ||
+        jointId === 'fingerTipL' ||
+        jointId === 'fingerL'
+      ) {
+        const isRight = jointId === 'fingerTipR' || jointId === 'fingerR';
+        const tipId: 'fingerTipR' | 'fingerTipL' = isRight ? 'fingerTipR' : 'fingerTipL';
+        const handId: JointId = isRight ? 'handR' : 'handL';
+        if (curArmature.joints[handId]?.physicsMode === 'rigid') return;
+        const tipJoint = computedJointsRef.current[tipId];
+        safeSetPointerCapture(e.pointerId);
+        setActiveDrag({
+          type: 'ik',
+          jointId: tipId,
+          startArmature: curArmature,
+          offsetX: tipJoint.x - world.x,
+          offsetY: tipJoint.y - world.y,
+        });
+        const source = isRight ? 'handR' : 'handL';
+        setActivePlusWorld(world);
+        onPlanquetteDragChange?.({ isDragging: true, source });
+        onPlanquetteDragMove?.({
+          source,
+          effectorJointId: tipId,
+          effectorWorld: { x: tipJoint.x, y: tipJoint.y },
+          pointerWorld: world,
+          pointerScreen: screen,
+        });
+        return;
+      }
+
       if (joint.mode === 'IK' && joint.spec.ikChain) {
         if (curArmature.joints[jointId].physicsMode === 'rigid') return;
         safeSetPointerCapture(e.pointerId);
         setActiveDrag({
           type: 'ik',
           jointId,
+          startArmature: curArmature,
           offsetX: joint.x - world.x,
           offsetY: joint.y - world.y,
         });
+        if (jointId === 'handR' || jointId === 'handL') {
+          setActivePlusWorld(world);
+          onPlanquetteDragChange?.({ isDragging: true, source: jointId });
+          onPlanquetteDragMove?.({
+            source: jointId,
+            effectorJointId: jointId,
+            effectorWorld: { x: joint.x, y: joint.y },
+            pointerWorld: world,
+            pointerScreen: screen,
+          });
+        }
         return;
       }
 
@@ -1043,11 +816,10 @@ export const BookStageCanvas: React.FC<BookStageCanvasProps> = React.memo(({
       beginFaceplateLookDrag,
       beginWaistBalanceDrag,
       clientToRigWorld,
-      canons.eightHeadTotalPx,
-      originOffset.y,
+      clientToScreenLocal,
+      onPlanquetteDragChange,
+      onPlanquetteDragMove,
       onSelectJoint,
-      rigSystems?.groundY,
-      rigSystems?.pressurePlateY,
       safeSetPointerCapture,
       setActiveDrag,
       startCumulativeFKRotate,
@@ -1061,37 +833,86 @@ export const BookStageCanvas: React.FC<BookStageCanvasProps> = React.memo(({
         return;
       }
       e.stopPropagation();
-      const clawJointId: JointId | null =
-        jointId === 'handR' || jointId === 'fingerR'
-          ? 'handR'
-          : jointId === 'handL' || jointId === 'fingerL'
-            ? 'handL'
-            : null;
-      onSelectJoint(clawJointId ?? jointId);
-      if (clawJointId) {
-        startCumulativeFKRotate(e, clawJointId);
-        return;
-      }
-      // Dragging the waist bowl activates grounded balance / hula / squat without moving feet
+      onSelectJoint(jointId);
       if (jointId === 'pelvis') {
         beginWaistBalanceDrag(e);
         return;
       }
-      // Dragging either half of the split collarbone folds it rotationally up or down
-      const drivenJointId: JointId =
-        jointId === 'clavOuterR' ? 'braceR' : jointId === 'clavOuterL' ? 'braceL' : jointId;
-      const curArmature = armatureRef.current;
-      const runtime = curArmature.joints[drivenJointId];
-      if (!runtime || runtime.mode === 'PIN' || runtime.physicsMode === 'rigid') return;
 
-      const boneSpec = JOINT_SPEC_MAP[jointId];
-      if (curArmature.joints[jointId]?.mode === 'IK' && boneSpec?.ikChain) {
-        const world = clientToRigWorld(e.clientX, e.clientY);
+      const curArmature = armatureRef.current;
+      const world = clientToRigWorld(e.clientX, e.clientY);
+      const screen = clientToScreenLocal(e.clientX, e.clientY);
+
+      // Grabbing hand wrist activates whole-arm wrist IK
+      if (jointId === 'handR' || jointId === 'handL') {
+        if (curArmature.joints[jointId]?.physicsMode === 'rigid') return;
         const joint = computedJointsRef.current[jointId];
         safeSetPointerCapture(e.pointerId);
         setActiveDrag({
           type: 'ik',
           jointId,
+          startArmature: curArmature,
+          offsetX: joint.x - world.x,
+          offsetY: joint.y - world.y,
+        });
+        setActivePlusWorld(world);
+        onPlanquetteDragChange?.({ isDragging: true, source: jointId });
+        onPlanquetteDragMove?.({
+          source: jointId,
+          effectorJointId: jointId,
+          effectorWorld: { x: joint.x, y: joint.y },
+          pointerWorld: world,
+          pointerScreen: screen,
+        });
+        return;
+      }
+
+      // Grabbing finger or fingertip activates whole-arm fingertip IK
+      if (
+        jointId === 'fingerR' ||
+        jointId === 'fingerTipR' ||
+        jointId === 'fingerL' ||
+        jointId === 'fingerTipL'
+      ) {
+        const isRight = jointId === 'fingerR' || jointId === 'fingerTipR';
+        const tipId: 'fingerTipR' | 'fingerTipL' = isRight ? 'fingerTipR' : 'fingerTipL';
+        const handId: JointId = isRight ? 'handR' : 'handL';
+        if (curArmature.joints[handId]?.physicsMode === 'rigid') return;
+        const tipJoint = computedJointsRef.current[tipId];
+        safeSetPointerCapture(e.pointerId);
+        setActiveDrag({
+          type: 'ik',
+          jointId: tipId,
+          startArmature: curArmature,
+          offsetX: tipJoint.x - world.x,
+          offsetY: tipJoint.y - world.y,
+        });
+        const source = isRight ? 'handR' : 'handL';
+        setActivePlusWorld(world);
+        onPlanquetteDragChange?.({ isDragging: true, source });
+        onPlanquetteDragMove?.({
+          source,
+          effectorJointId: tipId,
+          effectorWorld: { x: tipJoint.x, y: tipJoint.y },
+          pointerWorld: world,
+          pointerScreen: screen,
+        });
+        return;
+      }
+
+      const drivenJointId: JointId =
+        jointId === 'clavOuterR' ? 'braceR' : jointId === 'clavOuterL' ? 'braceL' : jointId;
+      const runtime = curArmature.joints[drivenJointId];
+      if (!runtime || runtime.mode === 'PIN' || runtime.physicsMode === 'rigid') return;
+
+      const boneSpec = JOINT_SPEC_MAP[jointId];
+      if (curArmature.joints[jointId]?.mode === 'IK' && boneSpec?.ikChain) {
+        const joint = computedJointsRef.current[jointId];
+        safeSetPointerCapture(e.pointerId);
+        setActiveDrag({
+          type: 'ik',
+          jointId,
+          startArmature: curArmature,
           offsetX: joint.x - world.x,
           offsetY: joint.y - world.y,
         });
@@ -1104,6 +925,9 @@ export const BookStageCanvas: React.FC<BookStageCanvasProps> = React.memo(({
       beginFaceplateLookDrag,
       beginWaistBalanceDrag,
       clientToRigWorld,
+      clientToScreenLocal,
+      onPlanquetteDragChange,
+      onPlanquetteDragMove,
       onSelectJoint,
       safeSetPointerCapture,
       setActiveDrag,
@@ -1113,8 +937,7 @@ export const BookStageCanvas: React.FC<BookStageCanvasProps> = React.memo(({
 
   const handlePointerMove = useCallback(
     ({ clientX, clientY }: Pick<React.PointerEvent<SVGSVGElement>, 'clientX' | 'clientY'>) => {
-      const mediaWorld = clientToSvgWorld(clientX, clientY);
-      const world = worldToMedia(mediaWorld, stageTransformRef.current, originOffset);
+      const world = clientToRigWorld(clientX, clientY);
       const cursorPatch = {
         hasCursor: true,
         cursor: {
@@ -1125,7 +948,7 @@ export const BookStageCanvas: React.FC<BookStageCanvasProps> = React.memo(({
 
       const activeDrag = dragRef.current;
       if (!activeDrag) {
-        enqueueScreenUpdate(cursorPatch);
+        enqueueUpdate(cursorPatch);
         return;
       }
 
@@ -1135,25 +958,7 @@ export const BookStageCanvas: React.FC<BookStageCanvasProps> = React.memo(({
           y: activeDrag.startPanY + (clientY - activeDrag.startClientY),
         };
         panRef.current = nextPan;
-        enqueueScreenUpdate({ ...cursorPatch, pan: nextPan });
-        return;
-      }
-
-      if (activeDrag.type === 'stage_origin') {
-        onUpdateStageTransform?.({
-          originX: Number((mediaWorld.x - originOffset.x + activeDrag.offsetX).toFixed(1)),
-          originY: Number((mediaWorld.y - originOffset.y + activeDrag.offsetY).toFixed(1)),
-        });
-        enqueueScreenUpdate(cursorPatch);
-        return;
-      }
-
-      if (activeDrag.type === 'world_pin') {
-        onUpdateWorldPin?.(activeDrag.pinId, {
-          x: Number((mediaWorld.x + activeDrag.offsetX).toFixed(1)),
-          y: Number((mediaWorld.y + activeDrag.offsetY).toFixed(1)),
-        });
-        enqueueScreenUpdate(cursorPatch);
+        enqueueUpdate({ ...cursorPatch, pan: nextPan });
         return;
       }
 
@@ -1163,9 +968,9 @@ export const BookStageCanvas: React.FC<BookStageCanvasProps> = React.memo(({
           world.y + activeDrag.offsetY,
           originOffset
         );
-        onUpdateRigSystems?.({ pressurePlateY: solution.pressurePlateY });
+        onUpdateRigSystems({ pressurePlateY: solution.pressurePlateY });
         armatureRef.current = solution.armature;
-        enqueueScreenUpdate({ ...cursorPatch, armature: solution.armature });
+        enqueueUpdate({ ...cursorPatch, armature: solution.armature });
         return;
       }
 
@@ -1177,15 +982,20 @@ export const BookStageCanvas: React.FC<BookStageCanvasProps> = React.memo(({
           y: activeDrag.startSeparation.y + world.y - activeDrag.startPointer.y,
         });
         armatureRef.current = nextArmature;
-        enqueueScreenUpdate({ ...cursorPatch, armature: nextArmature });
+        enqueueUpdate({ ...cursorPatch, armature: nextArmature });
         return;
       }
 
       if (activeDrag.type === 'faceplate_look') {
+        const screen = clientToScreenLocal(clientX, clientY);
+        const target = {
+          x: world.x + activeDrag.offsetX,
+          y: world.y + activeDrag.offsetY,
+        };
         const nextArmature = solveFaceplateLookIK(
           activeDrag.startArmature,
-          world.x + activeDrag.offsetX,
-          world.y + activeDrag.offsetY,
+          target.x,
+          target.y,
           originOffset,
           activeDrag.collarHold
         );
@@ -1199,18 +1009,21 @@ export const BookStageCanvas: React.FC<BookStageCanvasProps> = React.memo(({
           },
         };
         armatureRef.current = nextArmature;
-        enqueueScreenUpdate({ ...cursorPatch, armature: nextArmature });
-        return;
-      }
-
-      if (activeDrag.type === 'root_translate') {
-        const nextArmature: ArmatureState = {
-          ...curArmature,
-          rootX: world.x + activeDrag.offsetX,
-          rootY: world.y + activeDrag.offsetY,
-        };
-        armatureRef.current = nextArmature;
-        enqueueScreenUpdate({ ...cursorPatch, armature: nextArmature });
+        setActivePlusWorld(world);
+        onFaceplateDragMove?.({ pointer: world, target });
+        if (onPlanquetteDragMove) {
+          const nextComp = computeArmature(nextArmature, originOffset);
+          onPlanquetteDragMove({
+            source: 'faceplate',
+            effectorJointId: 'lip',
+            effectorWorld: { x: nextComp.lip.x, y: nextComp.lip.y },
+            headWorld: { x: nextComp.head.x, y: nextComp.head.y },
+            lipWorld: { x: nextComp.lip.x, y: nextComp.lip.y },
+            pointerWorld: world,
+            pointerScreen: screen,
+          });
+        }
+        enqueueUpdate({ ...cursorPatch, armature: nextArmature });
         return;
       }
 
@@ -1234,7 +1047,7 @@ export const BookStageCanvas: React.FC<BookStageCanvasProps> = React.memo(({
           }
         );
         armatureRef.current = nextArmature;
-        enqueueScreenUpdate({ ...cursorPatch, armature: nextArmature });
+        enqueueUpdate({ ...cursorPatch, armature: nextArmature });
         return;
       }
 
@@ -1258,36 +1071,32 @@ export const BookStageCanvas: React.FC<BookStageCanvasProps> = React.memo(({
           }
         );
         armatureRef.current = nextArmature;
-        enqueueScreenUpdate({ ...cursorPatch, armature: nextArmature });
+        enqueueUpdate({ ...cursorPatch, armature: nextArmature });
         return;
       }
 
       if (activeDrag.type === 'hip_toggle') {
-        const targetMidX = world.x + activeDrag.offsetX;
-        const targetMidY = world.y + activeDrag.offsetY;
         const nextArmature = solveHipToggleFromTarget(
           curArmature,
-          targetMidX,
-          targetMidY,
+          world.x + activeDrag.offsetX,
+          world.y + activeDrag.offsetY,
           originOffset
         );
         armatureRef.current = nextArmature;
-        enqueueScreenUpdate({ ...cursorPatch, armature: nextArmature });
+        enqueueUpdate({ ...cursorPatch, armature: nextArmature });
         return;
       }
 
       if (activeDrag.type === 'collar_toggle') {
-        const targetMidX = world.x + activeDrag.offsetX;
-        const targetMidY = world.y + activeDrag.offsetY;
         const nextArmature = solveCollarToggleFromTarget(
           curArmature,
           activeDrag.side,
-          targetMidX,
-          targetMidY,
+          world.x + activeDrag.offsetX,
+          world.y + activeDrag.offsetY,
           originOffset
         );
         armatureRef.current = nextArmature;
-        enqueueScreenUpdate({ ...cursorPatch, armature: nextArmature });
+        enqueueUpdate({ ...cursorPatch, armature: nextArmature });
         return;
       }
 
@@ -1297,7 +1106,7 @@ export const BookStageCanvas: React.FC<BookStageCanvasProps> = React.memo(({
           clientY - activeDrag.startClientY
         );
         if (!activeDrag.hasDragged && moveDist < 5) {
-          enqueueScreenUpdate(cursorPatch);
+          enqueueUpdate(cursorPatch);
           return;
         }
         if (!activeDrag.hasDragged) {
@@ -1313,36 +1122,62 @@ export const BookStageCanvas: React.FC<BookStageCanvasProps> = React.memo(({
             : rawNext;
         const nextArmature = setArmReverseSwivel(curArmature, activeDrag.side, snappedNext);
         armatureRef.current = nextArmature;
-        enqueueScreenUpdate({ ...cursorPatch, armature: nextArmature });
-        return;
-      }
-
-      if (activeDrag.type === 'vanishing_point') {
-        onVanishingPointChange?.({
-          x: world.x + activeDrag.offsetX,
-          y: world.y + activeDrag.offsetY,
-        });
-        enqueueScreenUpdate(cursorPatch);
+        enqueueUpdate({ ...cursorPatch, armature: nextArmature });
         return;
       }
 
       if (activeDrag.type === 'ik') {
         const targetX = world.x + activeDrag.offsetX;
         const targetY = world.y + activeDrag.offsetY;
-        const nextArmature = solveJointIK(
-          curArmature,
-          activeDrag.jointId,
-          targetX,
-          targetY,
-          originOffset,
-          {
-            solver: rigSystems?.solver ?? 'analytical',
-            softDamp: true,
-            constrainLimits: rigSystems?.softLimits ?? false,
-          }
-        );
+        const isArmEffector =
+          activeDrag.jointId === 'handR' ||
+          activeDrag.jointId === 'handL' ||
+          activeDrag.jointId === 'fingerTipR' ||
+          activeDrag.jointId === 'fingerTipL';
+        const nextArmature =
+          planquetteReachActive && isArmEffector && activeDrag.startArmature
+            ? solvePlanquetteArmReach(
+                activeDrag.startArmature,
+                activeDrag.jointId as 'handR' | 'handL' | 'fingerTipR' | 'fingerTipL',
+                targetX,
+                targetY,
+                originOffset,
+                {
+                  solver: rigSystems.solver,
+                  softDamp: true,
+                  constrainLimits: rigSystems.softLimits,
+                }
+              )
+            : solveJointIK(curArmature, activeDrag.jointId, targetX, targetY, originOffset, {
+                solver: rigSystems.solver,
+                softDamp: true,
+                constrainLimits: rigSystems.softLimits,
+              });
         armatureRef.current = nextArmature;
-        enqueueScreenUpdate({ ...cursorPatch, armature: nextArmature });
+        if (isArmEffector) {
+          const screen = clientToScreenLocal(clientX, clientY);
+          const source =
+            activeDrag.jointId === 'handR' || activeDrag.jointId === 'fingerTipR'
+              ? 'handR'
+              : 'handL';
+          setActivePlusWorld(world);
+          if (onPlanquetteDragMove) {
+            const nextComp = computeArmature(nextArmature, originOffset);
+            const eff = nextComp[activeDrag.jointId];
+            onPlanquetteDragMove({
+              source,
+              effectorJointId: activeDrag.jointId as
+                | 'handR'
+                | 'handL'
+                | 'fingerTipR'
+                | 'fingerTipL',
+              effectorWorld: { x: eff.x, y: eff.y },
+              pointerWorld: world,
+              pointerScreen: screen,
+            });
+          }
+        }
+        enqueueUpdate({ ...cursorPatch, armature: nextArmature });
         return;
       }
 
@@ -1350,25 +1185,25 @@ export const BookStageCanvas: React.FC<BookStageCanvasProps> = React.memo(({
         const { targetJointId, pivotX, pivotY, lastCursorDeg, rawAngle } = activeDrag;
         const distFromPivot = Math.hypot(world.x - pivotX, world.y - pivotY);
         if (distFromPivot < 4) {
-          enqueueScreenUpdate(cursorPatch);
+          enqueueUpdate(cursorPatch);
           return;
         }
         const currDeg = (Math.atan2(world.y - pivotY, world.x - pivotX) * 180) / Math.PI;
         if (lastCursorDeg === null) {
           dragRef.current = { ...activeDrag, lastCursorDeg: currDeg };
-          enqueueScreenUpdate(cursorPatch);
+          enqueueUpdate(cursorPatch);
           return;
         }
         const deltaCursor = shortestAngleDelta(lastCursorDeg, currDeg);
         if (Math.abs(deltaCursor) < 1e-4) {
-          enqueueScreenUpdate(cursorPatch);
+          enqueueUpdate(cursorPatch);
           return;
         }
 
         const runtime = curArmature.joints[targetJointId];
         const mult = getPhysicsMultiplier(runtime);
         if (mult === 0) {
-          enqueueScreenUpdate(cursorPatch);
+          enqueueUpdate(cursorPatch);
           return;
         }
 
@@ -1396,7 +1231,7 @@ export const BookStageCanvas: React.FC<BookStageCanvasProps> = React.memo(({
             },
           };
           armatureRef.current = nextArmature;
-          enqueueScreenUpdate({ ...cursorPatch, armature: nextArmature });
+          enqueueUpdate({ ...cursorPatch, armature: nextArmature });
           return;
         }
 
@@ -1426,7 +1261,7 @@ export const BookStageCanvas: React.FC<BookStageCanvasProps> = React.memo(({
           isClosedTriangleSwivel && swivelLimits
             ? Math.max(swivelLimits[0], Math.min(swivelLimits[1], constrainedAngle))
             : constrainedAngle;
-        let nextArmature: ArmatureState =
+        const nextArmature: ArmatureState =
           targetJointId === 'pelvis'
             ? {
                 ...curArmature,
@@ -1444,19 +1279,20 @@ export const BookStageCanvas: React.FC<BookStageCanvasProps> = React.memo(({
               };
 
         armatureRef.current = nextArmature;
-        enqueueScreenUpdate({ ...cursorPatch, armature: nextArmature });
+        enqueueUpdate({ ...cursorPatch, armature: nextArmature });
       }
     },
     [
-      clientToSvgWorld,
-      enqueueScreenUpdate,
+      clientToRigWorld,
+      clientToScreenLocal,
+      enqueueUpdate,
+      onFaceplateDragMove,
+      onPlanquetteDragMove,
       onUpdateRigSystems,
-      onUpdateStageTransform,
-      onUpdateWorldPin,
-      onVanishingPointChange,
       originOffset,
-      rigSystems?.softLimits,
-      rigSystems?.solver,
+      planquetteReachActive,
+      rigSystems.softLimits,
+      rigSystems.solver,
     ]
   );
 
@@ -1491,7 +1327,7 @@ export const BookStageCanvas: React.FC<BookStageCanvasProps> = React.memo(({
         svgRef.current.releasePointerCapture(e.pointerId);
       }
       const activeDrag = dragRef.current;
-      flushScreenFrame(true);
+      flushUpdates();
       const isSwivelClickToggle = Boolean(activeDrag?.type === 'arm_swivel' && !activeDrag.hasDragged);
       if (isSwivelClickToggle && activeDrag?.type === 'arm_swivel') {
         onCommitPoseHistory();
@@ -1507,7 +1343,6 @@ export const BookStageCanvas: React.FC<BookStageCanvasProps> = React.memo(({
         (activeDrag.type === 'fk_rotate' ||
           activeDrag.type === 'ik' ||
           activeDrag.type === 'faceplate_look' ||
-          activeDrag.type === 'root_translate' ||
           activeDrag.type === 'waist_balance' ||
           activeDrag.type === 'torso_balance' ||
           activeDrag.type === 'pressure_plate' ||
@@ -1519,29 +1354,38 @@ export const BookStageCanvas: React.FC<BookStageCanvasProps> = React.memo(({
         onCommitPoseHistory();
       }
       setActiveDrag(null);
+      setActivePlusWorld(null);
+      if (activeDrag?.type === 'faceplate_look') {
+        onFaceplateDragChange?.(false);
+        onPlanquetteDragChange?.({ isDragging: false, source: null });
+      } else if (
+        activeDrag?.type === 'ik' &&
+        (activeDrag.jointId === 'handR' ||
+          activeDrag.jointId === 'handL' ||
+          activeDrag.jointId === 'fingerTipR' ||
+          activeDrag.jointId === 'fingerTipL')
+      ) {
+        onPlanquetteDragChange?.({ isDragging: false, source: null });
+      }
+      if (activeDrag && activeDrag.type !== 'pan') {
+        onDragEnd?.();
+      }
     },
     [
       flushPendingPointerMove,
-      flushScreenFrame,
+      flushUpdates,
       onAnimateArmature,
       onCommitPoseHistory,
+      onDragEnd,
+      onFaceplateDragChange,
+      onPlanquetteDragChange,
       onUpdateArmature,
       setActiveDrag,
     ]
   );
 
-  const isPlateMedia = effectiveMedia.kind === 'image' || effectiveMedia.kind === 'video';
-  const showPaperCover =
-    effectiveMedia.kind === 'paper' && (effectiveMedia.paperVariant ?? 'cover') === 'cover' && isCover;
   const inkRgb = darkMode ? '240, 234, 248' : '22, 0, 30';
-  const inkHex = darkMode ? '#F0EAF8' : REPO_DARKEST_PURPLE;
-  const paperBg = darkMode
-    ? '#000000'
-    : isPlateMedia
-    ? '#CFCAC0'
-    : showPaperCover
-    ? '#CECAC2'
-    : '#EFECE6';
+  const paperBg = darkMode ? '#000000' : isCover ? '#CECAC2' : '#EFECE6';
 
   const eightHeadSpan = canons.eightHeadTotalPx;
   const eightHeadTopY = originOffset.y - eightHeadSpan / 2;
@@ -1556,9 +1400,8 @@ export const BookStageCanvas: React.FC<BookStageCanvasProps> = React.memo(({
     computedJoints.footL.y,
     computedJoints.toeL.endY
   );
-  const staticGroundY =
-    rigSystems?.groundY ?? originOffset.y + canons.eightHeadTotalPx / 2;
-  const activePressurePlateY = rigSystems?.pressurePlateY ?? pressurePlateY;
+  const staticGroundY = rigSystems.groundY;
+  const activePressurePlateY = rigSystems.pressurePlateY ?? pressurePlateY;
   const isPointGrounded = (y: number) =>
     Math.abs(y - activePressurePlateY) <= GROUND_CONTACT_TOLERANCE_PX;
   const groundedFootCount = [
@@ -1602,263 +1445,114 @@ export const BookStageCanvas: React.FC<BookStageCanvasProps> = React.memo(({
     `M ${endlessBounds.minX} ${activePressurePlateY + pressurePlateSlopePx} ` +
     `Q ${(endlessBounds.minX + endlessBounds.maxX) / 2} ${pressurePlateControlY} ` +
     `${endlessBounds.maxX} ${activePressurePlateY - pressurePlateSlopePx}`;
-  const calibratedStageTransform = buildStageSvgTransform(effectiveTransform, originOffset);
-  const isMotionActive = isPoseTransitioning || isPlaying || dragState !== null;
+  const isMotionActive = isPoseTransitioning || dragState !== null;
+  const isCursorHiddenForIK =
+    dragState?.type === 'faceplate_look' ||
+    (dragState?.type === 'ik' &&
+      (dragState.jointId === 'handR' ||
+        dragState.jointId === 'handL' ||
+        dragState.jointId === 'fingerTipR' ||
+        dragState.jointId === 'fingerTipL'));
 
   return (
     <div
       ref={containerRef}
       data-stage-viewport="true"
       data-page-id={pageId}
-      data-substrate={effectiveMedia.kind === 'paper' ? meta.substrate : effectiveMedia.kind}
-      data-media-kind={effectiveMedia.kind}
       data-dark-mode={darkMode ? 'true' : 'false'}
-      data-target-fps={screenFps}
       data-pose-interpolating={isPoseTransitioning ? 'true' : 'false'}
-      data-last-export={lastExportKind}
       data-vw={viewportSize.width}
       data-vh={viewportSize.height}
-      className="relative flex-1 w-full h-full overflow-hidden select-none transition-colors duration-300"
+      className={`relative flex-1 w-full h-full overflow-hidden select-none transition-colors duration-300 ${
+        isCursorHiddenForIK ? 'cursor-hidden-active' : ''
+      }`}
       style={{
         backgroundColor: paperBg,
-        cursor: dragState?.type === 'pan' ? 'grabbing' : 'crosshair',
+        cursor: isCursorHiddenForIK
+          ? 'none'
+          : dragState?.type === 'pan'
+          ? 'grabbing'
+          : 'crosshair',
       }}
     >
-      {/* 01. Procedural Paper Plate (Backing Leaf + Default 1901 Back Cover) */}
-      {effectiveMedia.kind === 'paper' && (
-        <>
-          <div
-            aria-hidden="true"
-            data-paper-surface="true"
-            data-paper-role="backing-leaf"
-            className="pointer-events-none absolute inset-0"
-          >
-            <img
-              src={REPOSITORY_ASSET_PATHS.page21PaperPng}
-              alt="Soft print paper leaf kept in the back"
-              referrerPolicy="no-referrer"
-              className={`absolute inset-0 w-full h-full object-cover transition-opacity duration-300 ${
-                darkMode ? 'invert opacity-[0.07]' : 'opacity-85'
-              }`}
-            />
-            <div
-              className="absolute inset-0"
-              style={{
-                backgroundImage: `url(${REPOSITORY_ASSET_PATHS.analogPaperPng})`,
-                backgroundSize: 'cover',
-                backgroundPosition: 'center',
-                backgroundRepeat: 'no-repeat',
-                opacity: darkMode ? 0.05 : 0.14,
-                filter: darkMode ? 'invert(1)' : undefined,
-                mixBlendMode: darkMode ? 'screen' : 'multiply',
-              }}
-            />
-          </div>
+      {/* Procedural Paper / Cover Substrate */}
+      <div
+        aria-hidden="true"
+        data-paper-surface="true"
+        data-paper-role="backing-leaf"
+        className="pointer-events-none absolute inset-0"
+      >
+        <img
+          src={REPOSITORY_ASSET_PATHS.page21PaperPng}
+          alt="Archival backing leaf"
+          referrerPolicy="no-referrer"
+          className={`absolute inset-0 w-full h-full object-cover transition-opacity duration-300 ${
+            darkMode ? 'invert opacity-[0.07]' : 'opacity-85'
+          }`}
+        />
+        <div
+          className="absolute inset-0"
+          style={{
+            backgroundImage: `url(${REPOSITORY_ASSET_PATHS.analogPaperPng})`,
+            backgroundSize: 'cover',
+            backgroundPosition: 'center',
+            backgroundRepeat: 'no-repeat',
+            opacity: darkMode ? 0.05 : 0.14,
+            filter: darkMode ? 'invert(1)' : undefined,
+            mixBlendMode: darkMode ? 'screen' : 'multiply',
+          }}
+        />
+      </div>
 
-          {showPaperCover && (
-            <div
-              aria-hidden="true"
-              data-cover-surface="true"
-              className="pointer-events-none absolute inset-0"
-              style={{ backgroundColor: darkMode ? '#000000' : '#CECAC2' }}
-            >
-              <img
-                src={REPOSITORY_ASSET_PATHS.page22CoverPng}
-                alt="Symmetrical mottled back cover texture traced from 1901 manual page 22"
-                referrerPolicy="no-referrer"
-                className={`absolute inset-0 w-full h-full object-cover transition-all duration-300 ${
-                  darkMode
-                    ? 'invert opacity-[0.09] contrast-125'
-                    : 'opacity-86 contrast-105'
-                }`}
-              />
-              <div
-                className="absolute inset-0"
-                style={{
-                  boxShadow: darkMode
-                    ? 'inset 0 0 0 1px rgba(255, 255, 255, 0.16), inset 0 0 42px rgba(0, 0, 0, 0.85)'
-                    : 'inset 0 0 0 2px rgba(22, 0, 30, 0.24), inset 0 0 42px rgba(20, 16, 24, 0.22)',
-                }}
-              />
-            </div>
-          )}
-        </>
-      )}
-
-      {/* 01b. External Image or Synced Video Backdrop Plate (World-space locked to pan/zoom) */}
-      {isPlateMedia && (
+      {isCover && (
         <div
           aria-hidden="true"
-          data-media-plate="true"
-          data-media-src={effectiveMedia.name}
-          className="pointer-events-none absolute inset-0 overflow-hidden"
+          data-cover-surface="true"
+          className="pointer-events-none absolute inset-0"
+          style={{ backgroundColor: darkMode ? '#000000' : '#CECAC2' }}
         >
+          <img
+            src={REPOSITORY_ASSET_PATHS.page22CoverPng}
+            alt="Symmetrical mottled back cover texture traced from 1901 manual page 22"
+            referrerPolicy="no-referrer"
+            className={`absolute inset-0 w-full h-full object-cover transition-all duration-300 ${
+              darkMode
+                ? 'invert opacity-[0.09] contrast-125'
+                : 'opacity-86 contrast-105'
+            }`}
+          />
           <div
+            className="absolute inset-0"
             style={{
-              position: 'absolute',
-              left: 0,
-              top: 0,
-              transformOrigin: '0 0',
-              transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`,
+              boxShadow: darkMode
+                ? 'inset 0 0 0 1px rgba(255, 255, 255, 0.16), inset 0 0 42px rgba(0, 0, 0, 0.85)'
+                : 'inset 0 0 0 2px rgba(22, 0, 30, 0.24), inset 0 0 42px rgba(20, 16, 24, 0.22)',
             }}
-          >
-            <div
-              style={{
-                position: 'absolute',
-                left: mediaPlateBox.x,
-                top: mediaPlateBox.y,
-                width: mediaPlateBox.width,
-                height: mediaPlateBox.height,
-                boxShadow: '0 24px 60px rgba(0, 0, 0, 0.52), 0 0 0 2px rgba(235, 224, 245, 0.16)',
-                backgroundColor: '#D6D0C5',
-              }}
-            >
-              {effectiveMedia.kind === 'image' ? (
-                <img
-                  src={effectiveMedia.src}
-                  alt={effectiveMedia.name}
-                  className={`w-full h-full object-cover ${darkMode ? 'brightness-75 contrast-115' : ''}`}
-                />
-              ) : (
-                <video
-                  ref={videoRef}
-                  src={effectiveMedia.src}
-                  muted
-                  playsInline
-                  loop={effectiveMedia.loop}
-                  className={`w-full h-full object-cover ${darkMode ? 'brightness-75 contrast-115' : ''}`}
-                />
-              )}
-              {effectiveFilter.paperGrain > 0 && (
-                <div
-                  className="absolute inset-0 pointer-events-none"
-                  style={{
-                    backgroundImage: `url(${REPOSITORY_ASSET_PATHS.analogPaperPng})`,
-                    backgroundSize: 'cover',
-                    backgroundPosition: 'center',
-                    opacity: Math.min(0.45, effectiveFilter.paperGrain * 0.34),
-                    mixBlendMode: 'multiply',
-                  }}
-                />
-              )}
-            </div>
-          </div>
+          />
         </div>
       )}
 
-      {/* Main Proportional SVG World Plane (Mounted onto the Active Scene Backdrop Plate) */}
+      {/* Main Proportional SVG World Plane */}
       <svg
         ref={svgRef}
         data-world-canvas="true"
-        className={`relative w-full h-full block touch-none transition-opacity duration-200 ${
-          showCoverWorkspace ? 'opacity-100' : 'opacity-0 pointer-events-none'
-        }`}
+        className="relative w-full h-full block touch-none"
         onContextMenu={(e) => e.preventDefault()}
         onPointerDownCapture={(e) => {
-          if (e.button === 0) {
-            pointerDownPosRef.current = { x: e.clientX, y: e.clientY };
-            if (e.metaKey && e.shiftKey) {
-              e.preventDefault();
-              e.stopPropagation();
-              beginPanDrag(e);
-            }
-          }
-          if (e.button === 2) {
+          if (e.button === 0 && e.metaKey && e.shiftKey) {
             e.preventDefault();
             e.stopPropagation();
-            safeSetPointerCapture(e.pointerId);
-            if (rightClickTimerRef.current !== null) {
-              window.clearTimeout(rightClickTimerRef.current);
-              rightClickTimerRef.current = null;
-            }
-            const now = performance.now();
-            const prev = lastRightClickRef.current;
-            if (
-              prev &&
-              now - prev.time <= 450 &&
-              Math.hypot(e.clientX - prev.x, e.clientY - prev.y) <= 16
-            ) {
-              lastRightClickRef.current = null;
-              const svgEl = svgRef.current;
-              if (svgEl) {
-                void saveTransparentModelImage(svgEl, computedJointsRef.current).then((res) => {
-                  if (res) setLastExportKind('png');
-                });
-              }
-            } else {
-              lastRightClickRef.current = { time: now, x: e.clientX, y: e.clientY };
-              rightClickTimerRef.current = window.setTimeout(() => {
-                rightClickTimerRef.current = null;
-                lastRightClickRef.current = null;
-                void Promise.resolve(onCopyPoseData()).then(() => {
-                  setLastExportKind('clipboard');
-                });
-              }, 600);
-            }
+            beginPanDrag(e);
           }
         }}
         onPointerDown={handlePointerDownStage}
         onPointerMove={(e) => queuePointerMove(e.clientX, e.clientY)}
-        onPointerUpCapture={(e) => {
-          if (e.button !== 2 || rightClickTimerRef.current === null) return;
-          window.clearTimeout(rightClickTimerRef.current);
-          rightClickTimerRef.current = null;
-        }}
-        onPointerCancelCapture={() => {
-          if (rightClickTimerRef.current === null) return;
-          window.clearTimeout(rightClickTimerRef.current);
-          rightClickTimerRef.current = null;
-        }}
         onPointerUp={handlePointerUp}
+        onPointerCancel={handlePointerUp}
         onPointerLeave={() => {
           flushPendingPointerMove();
-          enqueueScreenUpdate({ hasCursor: true, cursor: null });
-          flushScreenFrame(true);
-        }}
-        onClick={(e) => {
-          if (e.button !== 0) return;
-          const downPos = pointerDownPosRef.current;
-          pointerDownPosRef.current = null;
-          if (downPos && Math.hypot(e.clientX - downPos.x, e.clientY - downPos.y) > 6) {
-            lastLeftClickRef.current = null;
-            return;
-          }
-          const now = performance.now();
-          const prev = lastLeftClickRef.current;
-          const withinWindow =
-            prev &&
-            now - prev.time <= 380 &&
-            Math.hypot(e.clientX - prev.x, e.clientY - prev.y) <= 16;
-          const nextCount = withinWindow ? prev.count + 1 : 1;
-          lastLeftClickRef.current = {
-            time: now,
-            x: e.clientX,
-            y: e.clientY,
-            count: nextCount,
-          };
-
-          if (leftClickTimerRef.current !== null) {
-            window.clearTimeout(leftClickTimerRef.current);
-            leftClickTimerRef.current = null;
-          }
-          if (rightClickTimerRef.current !== null) {
-            window.clearTimeout(rightClickTimerRef.current);
-            rightClickTimerRef.current = null;
-          }
-
-          if (nextCount >= 3) {
-            lastLeftClickRef.current = null;
-            onSavePoseData();
-            setLastExportKind('pose');
-          } else if (nextCount === 2) {
-            leftClickTimerRef.current = window.setTimeout(() => {
-              leftClickTimerRef.current = null;
-              lastLeftClickRef.current = null;
-              void Promise.resolve(onCopyPoseData()).then(() => {
-                setLastExportKind('clipboard');
-              });
-            }, 250);
-          }
+          enqueueUpdate({ hasCursor: true, cursor: null });
+          flushUpdates();
         }}
       >
         <defs>
@@ -1873,7 +1567,7 @@ export const BookStageCanvas: React.FC<BookStageCanvasProps> = React.memo(({
             <path
               d={`M ${SUBPYXL_PX} 0 L 0 0 0 ${SUBPYXL_PX}`}
               fill="none"
-              stroke={`rgba(${inkRgb}, ${inkOpacity.sub})`}
+              stroke={`rgba(${inkRgb}, ${LIGHT_INK_OPACITY.sub})`}
               strokeWidth={0.5}
               vectorEffect="non-scaling-stroke"
             />
@@ -1889,7 +1583,7 @@ export const BookStageCanvas: React.FC<BookStageCanvasProps> = React.memo(({
             <path
               d={`M ${PYXL_PX} 0 L 0 0 0 ${PYXL_PX}`}
               fill="none"
-              stroke={`rgba(${inkRgb}, ${inkOpacity.pyxl})`}
+              stroke={`rgba(${inkRgb}, ${LIGHT_INK_OPACITY.pyxl})`}
               strokeWidth={0.9}
               vectorEffect="non-scaling-stroke"
             />
@@ -1905,7 +1599,7 @@ export const BookStageCanvas: React.FC<BookStageCanvasProps> = React.memo(({
             <path
               d={`M ${MEGAPYXL_PX} 0 L 0 0 0 ${MEGAPYXL_PX}`}
               fill="none"
-              stroke={`rgba(${inkRgb}, ${inkOpacity.mega})`}
+              stroke={`rgba(${inkRgb}, ${LIGHT_INK_OPACITY.mega})`}
               strokeWidth={1.35}
               vectorEffect="non-scaling-stroke"
             />
@@ -1992,8 +1686,6 @@ export const BookStageCanvas: React.FC<BookStageCanvasProps> = React.memo(({
         </defs>
 
         <g transform={`translate(${pan.x}, ${pan.y}) scale(${zoom})`}>
-          {/* 02. Calibration Grid & Calibrated Rig Plane (StageTransform) */}
-          <g data-stage-calibrated="true" transform={calibratedStageTransform}>
           {/* Endless proportional light ink grid layers */}
           {grid.showSubpyxl && (
             <rect
@@ -2034,7 +1726,7 @@ export const BookStageCanvas: React.FC<BookStageCanvasProps> = React.memo(({
               y1={endlessBounds.minY - 1200}
               x2={originOffset.x}
               y2={endlessBounds.maxY + 1200}
-              stroke={`rgba(${inkRgb}, ${inkOpacity.axis})`}
+              stroke={`rgba(${inkRgb}, ${LIGHT_INK_OPACITY.axis})`}
               strokeWidth={1.1}
               vectorEffect="non-scaling-stroke"
             />
@@ -2043,7 +1735,7 @@ export const BookStageCanvas: React.FC<BookStageCanvasProps> = React.memo(({
               y1={originOffset.y}
               x2={endlessBounds.maxX + 1200}
               y2={originOffset.y}
-              stroke={`rgba(${inkRgb}, ${inkOpacity.axis})`}
+              stroke={`rgba(${inkRgb}, ${LIGHT_INK_OPACITY.axis})`}
               strokeWidth={1.1}
               vectorEffect="non-scaling-stroke"
             />
@@ -2051,15 +1743,15 @@ export const BookStageCanvas: React.FC<BookStageCanvasProps> = React.memo(({
               <circle
                 r={7}
                 fill="none"
-                stroke={`rgba(${inkRgb}, ${inkOpacity.axis + 0.18})`}
+                stroke={`rgba(${inkRgb}, ${LIGHT_INK_OPACITY.axis + 0.18})`}
                 strokeWidth={1.1}
               />
-              <circle r={1.8} fill={`rgba(${inkRgb}, ${inkOpacity.axis + 0.3})`} />
+              <circle r={1.8} fill={`rgba(${inkRgb}, ${LIGHT_INK_OPACITY.axis + 0.3})`} />
             </g>
           </g>
 
-          {/* Backlit Cover Paper: Navel-Centered Halo + Dimming Outside Vitruvian Square & Circle */}
-          {showCoverWorkspace && !isPlateMedia && (
+          {/* Backlit Cover Paper: Navel-Centered Halo + Outer Dim */}
+          {isCover && (
             <>
               <g data-navel-halo="true" pointerEvents="none">
                 <circle
@@ -2096,7 +1788,7 @@ export const BookStageCanvas: React.FC<BookStageCanvasProps> = React.memo(({
                 width={canons.workingSquareSidePx}
                 height={canons.workingSquareSidePx}
                 fill="none"
-                stroke={`rgba(${inkRgb}, ${inkOpacity.guide})`}
+                stroke={`rgba(${inkRgb}, ${LIGHT_INK_OPACITY.guide})`}
                 strokeWidth={1.1}
                 vectorEffect="non-scaling-stroke"
               />
@@ -2105,7 +1797,7 @@ export const BookStageCanvas: React.FC<BookStageCanvasProps> = React.memo(({
                 y1={wsY}
                 x2={wsX + canons.workingSquareSidePx}
                 y2={wsY + canons.workingSquareSidePx}
-                stroke={`rgba(${inkRgb}, ${inkOpacity.guide * 0.42})`}
+                stroke={`rgba(${inkRgb}, ${LIGHT_INK_OPACITY.guide * 0.42})`}
                 strokeWidth={0.75}
                 strokeDasharray="4 6"
                 vectorEffect="non-scaling-stroke"
@@ -2115,7 +1807,7 @@ export const BookStageCanvas: React.FC<BookStageCanvasProps> = React.memo(({
                 y1={wsY}
                 x2={wsX}
                 y2={wsY + canons.workingSquareSidePx}
-                stroke={`rgba(${inkRgb}, ${inkOpacity.guide * 0.42})`}
+                stroke={`rgba(${inkRgb}, ${LIGHT_INK_OPACITY.guide * 0.42})`}
                 strokeWidth={0.75}
                 strokeDasharray="4 6"
                 vectorEffect="non-scaling-stroke"
@@ -2132,7 +1824,7 @@ export const BookStageCanvas: React.FC<BookStageCanvasProps> = React.memo(({
                 width={canons.vitruvianSquareWidth}
                 height={canons.vitruvianSquareHeight}
                 fill="none"
-                stroke={`rgba(${inkRgb}, ${inkOpacity.guide})`}
+                stroke={`rgba(${inkRgb}, ${LIGHT_INK_OPACITY.guide})`}
                 strokeWidth={1.1}
                 vectorEffect="non-scaling-stroke"
               />
@@ -2141,7 +1833,7 @@ export const BookStageCanvas: React.FC<BookStageCanvasProps> = React.memo(({
                 cy={originOffset.y}
                 r={canons.vitruvianCircleRadius}
                 fill="none"
-                stroke={`rgba(${inkRgb}, ${inkOpacity.guide})`}
+                stroke={`rgba(${inkRgb}, ${LIGHT_INK_OPACITY.guide})`}
                 strokeWidth={1.1}
                 strokeDasharray="5 5"
                 vectorEffect="non-scaling-stroke"
@@ -2183,8 +1875,8 @@ export const BookStageCanvas: React.FC<BookStageCanvasProps> = React.memo(({
             </g>
           )}
 
-          {/* Cover / Plate Calibration Spec Caption */}
-          {showCoverWorkspace && (
+          {/* Archival Proportional Spec Caption */}
+          {isCover && (
             <g pointerEvents="none">
               <text
                 x={originOffset.x}
@@ -2195,9 +1887,7 @@ export const BookStageCanvas: React.FC<BookStageCanvasProps> = React.memo(({
                 fontFamily="UMTypewriter, monospace"
                 letterSpacing="4"
               >
-                {isPlateMedia
-                  ? `${effectiveMedia.name.toUpperCase()} · CALIBRATION PLATE`
-                  : 'BACK COVER · PROPORTIONAL CANVAS'}
+                BITRUVIUS · VITRUVIAN PROPORTIONAL RIG
               </text>
               <text
                 x={originOffset.x}
@@ -2207,79 +1897,12 @@ export const BookStageCanvas: React.FC<BookStageCanvasProps> = React.memo(({
                 fontSize={17}
                 fontFamily="Bitstream Vera Sans Mono, monospace"
               >
-                {isPlateMedia
-                  ? `PYX SCALE ${effectiveTransform.pyxScale.toFixed(2)}× · TILT ${effectiveTransform.rotation.toFixed(1)}° · ORIGIN (${Math.round(effectiveTransform.originX)}, ${Math.round(effectiveTransform.originY)})`
-                  : 'TORSO 1.25× HIPS · 1.00 PYX = 100 PX · R = 6.35 PYX'}
+                TORSO 1.25× HIPS · 1.00 PYX = 100 PX · R = 6.35 PYX
               </text>
             </g>
           )}
 
-          {/* 1-Point Perspective Grid & Draggable Vanishing Point */}
-          {showPerspective && vanishingPoint && (
-            <g data-perspective-overlay="true">
-              {/* Horizon Line */}
-              <line
-                x1={endlessBounds.minX}
-                y1={vanishingPoint.y}
-                x2={endlessBounds.maxX}
-                y2={vanishingPoint.y}
-                stroke={darkMode ? 'rgba(216, 180, 254, 0.46)' : 'rgba(95, 0, 128, 0.28)'}
-                strokeWidth={1.6}
-                strokeDasharray="6 4"
-                vectorEffect="non-scaling-stroke"
-                pointerEvents="none"
-              />
-              {/* Radial perspective rays */}
-              {PERSPECTIVE_RAY_VECTORS.map((ray) => (
-                <line
-                  key={`vp-ray-${ray.idx}`}
-                  x1={vanishingPoint.x}
-                  y1={vanishingPoint.y}
-                  x2={vanishingPoint.x + ray.dx}
-                  y2={vanishingPoint.y + ray.dy}
-                  stroke={darkMode ? 'rgba(192, 132, 252, 0.16)' : 'rgba(95, 0, 128, 0.14)'}
-                  strokeWidth={0.85}
-                  vectorEffect="non-scaling-stroke"
-                  pointerEvents="none"
-                />
-              ))}
-              {/* Draggable Vanishing Point Handle */}
-              <g
-                transform={`translate(${vanishingPoint.x}, ${vanishingPoint.y}) scale(${1 / zoom})`}
-                style={{ cursor: 'move' }}
-                onPointerDown={(e) => {
-                  e.stopPropagation();
-                  const world = clientToSvgWorld(e.clientX, e.clientY);
-                  safeSetPointerCapture(e.pointerId);
-                  setActiveDrag({
-                    type: 'vanishing_point',
-                    offsetX: vanishingPoint.x - world.x,
-                    offsetY: vanishingPoint.y - world.y,
-                  });
-                }}
-              >
-                <circle r={14} fill="transparent" />
-                <circle
-                  r={7}
-                  fill={darkMode ? 'rgba(13, 148, 136, 0.28)' : 'rgba(13, 148, 136, 0.18)'}
-                  stroke={darkMode ? '#5EEAD4' : '#0D9488'}
-                  strokeWidth={1.4}
-                />
-                <circle r={2.2} fill={darkMode ? '#5EEAD4' : '#0D9488'} />
-                <text
-                  x={11}
-                  y={4}
-                  fill={darkMode ? '#5EEAD4' : '#0D9488'}
-                  fontSize={10}
-                  fontFamily="Bitstream Vera Sans Mono, monospace"
-                  fontWeight={700}
-                >
-                  VP
-                </text>
-              </g>
-            </g>
-          )}
-
+          {/* Static Horizon & Interactive Pressure Plate Ground Line */}
           <line
             data-ground-reference="true"
             x1={endlessBounds.minX}
@@ -2319,10 +1942,10 @@ export const BookStageCanvas: React.FC<BookStageCanvasProps> = React.memo(({
             onPointerLeave={() => setIsGroundLineHovered(false)}
             onPointerDown={beginPressurePlateDrag}
           >
-            <title>Drag vertically to change ground pressure; toes compensate within joint limits</title>
+            <title>Drag vertically to adjust ground pressure plate</title>
           </path>
 
-          {/* Pure Data Procedural SVG Digital Bones Puppet */}
+          {/* 43-Joint Vitruvian Ink Mannequin */}
           <DigitalMannequin
             armature={armature}
             computedJoints={computedJoints}
@@ -2331,7 +1954,6 @@ export const BookStageCanvas: React.FC<BookStageCanvasProps> = React.memo(({
             darkMode={darkMode}
             isPanning={dragState?.type === 'pan'}
             isMotionActive={isMotionActive}
-            compositeFilter={effectiveFilter}
             onPointerDownJoint={handlePointerDownJoint}
             onPointerDownBone={handlePointerDownBone}
             onPointerDownHipToggle={handlePointerDownHipToggle}
@@ -2340,234 +1962,32 @@ export const BookStageCanvas: React.FC<BookStageCanvasProps> = React.memo(({
             onResetNeckCollarMagnet={resetNeckCollarMagnet}
             onPointerDownTorso={beginTorsoBalanceDrag}
           />
-          </g>
-
-          {/* Draggable Calibration Origin Handle (Shown when Scene Calibration active) */}
-          {showCalibrationOrigin && onUpdateStageTransform && (
+          {worldOverlay}
+          {isCursorHiddenForIK && activePlusWorld && (
             <g
-              data-calibration-origin-handle="true"
-              transform={`translate(${originOffset.x + effectiveTransform.originX}, ${originOffset.y + effectiveTransform.originY}) scale(${1 / zoom})`}
-              style={{ cursor: 'move' }}
-              onPointerDown={(e) => {
-                e.stopPropagation();
-                const mediaWorld = clientToSvgWorld(e.clientX, e.clientY);
-                safeSetPointerCapture(e.pointerId);
-                setActiveDrag({
-                  type: 'stage_origin',
-                  offsetX: originOffset.x + effectiveTransform.originX - mediaWorld.x,
-                  offsetY: originOffset.y + effectiveTransform.originY - mediaWorld.y,
-                });
-              }}
+              data-ik-green-plus="true"
+              transform={`translate(${activePlusWorld.x}, ${activePlusWorld.y}) scale(${1 / zoom})`}
+              pointerEvents="none"
             >
-              <circle r={18} fill="transparent" />
-              <circle
-                r={10}
-                fill="rgba(52, 211, 153, 0.16)"
-                stroke="#34D399"
-                strokeWidth={1.4}
-                strokeDasharray="3 2"
+              <path
+                d="M -7 0 H 7 M 0 -7 V 7"
+                fill="none"
+                stroke={darkMode ? '#4ADE80' : '#16A34A'}
+                strokeWidth={2}
+                strokeLinecap="square"
               />
-              <line x1={-14} y1={0} x2={14} y2={0} stroke="#34D399" strokeWidth={1.1} />
-              <line x1={0} y1={-14} x2={0} y2={14} stroke="#34D399" strokeWidth={1.1} />
-              <text
-                x={14}
-                y={-8}
-                fill="#34D399"
-                fontSize={10}
-                fontFamily="Bitstream Vera Sans Mono, monospace"
-                fontWeight={700}
-              >
-                PYX ORIGIN
-              </text>
-            </g>
-          )}
-
-          {/* 03. Grounding / Pinning: WorldPin Anchor Reticles in Media Space */}
-          {worldPins.length > 0 && (
-            <g data-world-pins-layer="true">
-              {worldPins.map((pin) => {
-                const inRange =
-                  pin.enabled &&
-                  timelineT + 1e-6 >= pin.frameRange[0] &&
-                  timelineT - 1e-6 <= pin.frameRange[1];
-                const shortCode = JOINT_SPEC_MAP[pin.jointId]?.shortCode ?? pin.jointId;
-                return (
-                  <g
-                    key={pin.id}
-                    data-world-pin={pin.jointId}
-                    data-pin-active={inRange ? 'true' : 'false'}
-                    transform={`translate(${pin.mediaSpaceXY.x}, ${pin.mediaSpaceXY.y}) scale(${1 / zoom})`}
-                    style={{ cursor: onUpdateWorldPin ? 'move' : 'default' }}
-                    onPointerDown={(e) => {
-                      if (!onUpdateWorldPin) return;
-                      e.stopPropagation();
-                      const mediaWorld = clientToSvgWorld(e.clientX, e.clientY);
-                      safeSetPointerCapture(e.pointerId);
-                      setActiveDrag({
-                        type: 'world_pin',
-                        pinId: pin.id,
-                        offsetX: pin.mediaSpaceXY.x - mediaWorld.x,
-                        offsetY: pin.mediaSpaceXY.y - mediaWorld.y,
-                      });
-                    }}
-                  >
-                    <circle r={14} fill="transparent" />
-                    <polygon
-                      points="0,-7 7,0 0,7 -7,0"
-                      fill={inRange ? 'rgba(245, 158, 11, 0.28)' : 'rgba(148, 163, 184, 0.14)'}
-                      stroke={inRange ? '#D97706' : '#94A3B8'}
-                      strokeWidth={1.5}
-                      strokeDasharray={inRange ? undefined : '2 2'}
-                    />
-                    <circle r={2} fill={inRange ? '#F59E0B' : '#94A3B8'} />
-                    <text
-                      x={0}
-                      y={18}
-                      textAnchor="middle"
-                      fill={inRange ? '#B45309' : '#64748B'}
-                      stroke={darkMode ? 'rgba(10, 4, 16, 0.85)' : 'rgba(245, 240, 232, 0.88)'}
-                      strokeWidth={2.5}
-                      paintOrder="stroke"
-                      fontSize={9}
-                      fontFamily="Bitstream Vera Sans Mono, monospace"
-                      fontWeight={700}
-                    >
-                      {shortCode}
-                    </text>
-                  </g>
-                );
-              })}
             </g>
           )}
         </g>
       </svg>
 
-      {/* Symmetrical Edge Rulers (light ink ticks hugging all 4 inner borders symmetrically) */}
-      {showCoverWorkspace && grid.showRulers && (
-        <svg
-          aria-hidden="true"
-          className="pointer-events-none absolute inset-0 w-full h-full z-[6]"
-          viewBox={`0 0 ${viewportSize.width} ${viewportSize.height}`}
-          preserveAspectRatio="none"
-        >
-          <g>
-            {rulerTicks.xTicks.map((tick, idx) => (
-              <React.Fragment key={`rx-${idx}`}>
-                <g transform={`translate(${tick.screen}, ${borderLayout.edgeThickness})`}>
-                  <line
-                    x1={0}
-                    y1={0}
-                    x2={0}
-                    y2={tick.tier === 'mega' ? 9 : tick.tier === 'major' ? 7 : 4}
-                    stroke={`rgba(${inkRgb}, ${tick.tier === 'mega' ? 0.58 : tick.tier === 'major' ? 0.38 : 0.22})`}
-                    strokeWidth={tick.tier === 'mega' ? 1.25 : 0.9}
-                  />
-                  {tick.label && (
-                    <text
-                      x={0}
-                      y={19}
-                      textAnchor="middle"
-                      fill={inkHex}
-                      fillOpacity={tick.tier === 'mega' ? 0.72 : 0.52}
-                      fontSize={tick.tier === 'mega' ? 10 : 9}
-                      fontWeight={tick.tier === 'mega' ? 700 : 400}
-                      fontFamily="UMTypewriter, monospace"
-                    >
-                      {tick.label}
-                    </text>
-                  )}
-                </g>
-                <g transform={`translate(${tick.screen}, ${viewportSize.height - borderLayout.edgeThickness})`}>
-                  <line
-                    x1={0}
-                    y1={0}
-                    x2={0}
-                    y2={-(tick.tier === 'mega' ? 9 : tick.tier === 'major' ? 7 : 4)}
-                    stroke={`rgba(${inkRgb}, ${tick.tier === 'mega' ? 0.48 : tick.tier === 'major' ? 0.3 : 0.18})`}
-                    strokeWidth={tick.tier === 'mega' ? 1.25 : 0.9}
-                  />
-                </g>
-              </React.Fragment>
-            ))}
-
-            {rulerTicks.yTicks.map((tick, idx) => (
-              <React.Fragment key={`ry-${idx}`}>
-                <g transform={`translate(${borderLayout.edgeThickness}, ${tick.screen})`}>
-                  <line
-                    x1={0}
-                    y1={0}
-                    x2={tick.tier === 'mega' ? 9 : tick.tier === 'major' ? 7 : 4}
-                    y2={0}
-                    stroke={`rgba(${inkRgb}, ${tick.tier === 'mega' ? 0.58 : tick.tier === 'major' ? 0.38 : 0.22})`}
-                    strokeWidth={tick.tier === 'mega' ? 1.25 : 0.9}
-                  />
-                  {tick.label && (
-                    <text
-                      x={13}
-                      y={3}
-                      textAnchor="start"
-                      fill={inkHex}
-                      fillOpacity={tick.tier === 'mega' ? 0.72 : 0.52}
-                      fontSize={tick.tier === 'mega' ? 10 : 9}
-                      fontWeight={tick.tier === 'mega' ? 700 : 400}
-                      fontFamily="UMTypewriter, monospace"
-                    >
-                      {tick.label}
-                    </text>
-                  )}
-                </g>
-                <g transform={`translate(${viewportSize.width - borderLayout.edgeThickness}, ${tick.screen})`}>
-                  <line
-                    x1={0}
-                    y1={0}
-                    x2={-(tick.tier === 'mega' ? 9 : tick.tier === 'major' ? 7 : 4)}
-                    y2={0}
-                    stroke={`rgba(${inkRgb}, ${tick.tier === 'mega' ? 0.48 : tick.tier === 'major' ? 0.3 : 0.18})`}
-                    strokeWidth={tick.tier === 'mega' ? 1.25 : 0.9}
-                  />
-                </g>
-              </React.Fragment>
-            ))}
-          </g>
-        </svg>
-      )}
-
-      {/* Turning Page/Board Overlay Plane */}
-      {turnAnim && (
-        <div
-          key={`leaf-${turnAnim.key}`}
-          aria-hidden="true"
-          className={`pointer-events-none absolute inset-0 z-[8] ${
-            turnAnim.fromSubstrate === 'cover' || turnAnim.toSubstrate === 'cover'
-              ? turnAnim.direction === 'next'
-                ? 'animate-cover-next'
-                : 'animate-cover-prev'
-              : turnAnim.direction === 'next'
-              ? 'animate-paper-next'
-              : 'animate-paper-prev'
-          }`}
-          style={{
-            backgroundColor: darkMode
-              ? 'rgba(10, 10, 14, 0.92)'
-              : turnAnim.fromSubstrate === 'cover'
-              ? 'rgba(206, 202, 194, 0.92)'
-              : 'rgba(239, 236, 230, 0.90)',
-            boxShadow: darkMode
-              ? '0 0 42px rgba(255, 255, 255, 0.18)'
-              : turnAnim.fromSubstrate === 'cover'
-              ? '0 0 48px rgba(0, 0, 0, 0.42)'
-              : '0 0 32px rgba(28, 20, 34, 0.22)',
-          }}
-        />
-      )}
-
-      {/* Symmetrical Scan-Edge Border & Edge Animation Engine */}
+      {/* Symmetrical Scan-Edge Stage Border */}
       <ScanBorderLayer
         vw={viewportSize.width}
         vh={viewportSize.height}
         substrate={meta.substrate}
         darkMode={darkMode}
-        turnAnim={turnAnim}
+        turnAnim={null}
       />
     </div>
   );

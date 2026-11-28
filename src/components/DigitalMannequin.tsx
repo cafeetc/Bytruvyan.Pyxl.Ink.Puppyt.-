@@ -9,13 +9,13 @@ import {
   TORSO_HANDLE_CENTER_SVG,
 } from '../data/digitalRig';
 import { ArmatureState, ComputedJoint, JointId, Point2D } from '../types/rig';
-import { CompositeFilter } from '../types/scene';
 import {
   applyAffine,
   computeSvgBoneMatrix,
   HIP_BRIDGE_LINK_STAGE_PX,
   solveToggleHinge2Link,
 } from '../utils/kinematics';
+import { PUPPYT_TO_EVOLVED_SCALE } from '../utils/proportions';
 
 interface DigitalMannequinProps {
   armature: ArmatureState;
@@ -25,7 +25,6 @@ interface DigitalMannequinProps {
   darkMode: boolean;
   isPanning: boolean;
   isMotionActive?: boolean;
-  compositeFilter?: CompositeFilter;
   onPointerDownJoint: (e: React.PointerEvent<SVGGElement>, jointId: JointId) => void;
   onPointerDownBone: (e: React.PointerEvent<SVGElement>, jointId: JointId) => void;
   onPointerDownHipToggle?: (e: React.PointerEvent<SVGElement>) => void;
@@ -38,6 +37,27 @@ interface DigitalMannequinProps {
 const DARK_MODE_BONE_GREEN = '#34D399';
 const DARK_MODE_FLESH_GREEN = '#6EE7B7';
 const DARK_MODE_HIGHLIGHT_PURPLE = '#D8B4FE';
+const DARK_MODE_COOL_CRIMSON = '#F43F5E';
+
+function blendHexColors(fromHex: string, toHex: string, ratio: number): string {
+  const t = Math.max(0, Math.min(1, ratio));
+  if (t <= 0) return fromHex;
+  if (t >= 1) return toHex;
+  const parse = (hex: string) => {
+    const clean = hex.replace('#', '');
+    return [
+      parseInt(clean.slice(0, 2), 16),
+      parseInt(clean.slice(2, 4), 16),
+      parseInt(clean.slice(4, 6), 16),
+    ];
+  };
+  const [r1, g1, b1] = parse(fromHex);
+  const [r2, g2, b2] = parse(toHex);
+  const r = Math.round(r1 + (r2 - r1) * t);
+  const g = Math.round(g1 + (g2 - g1) * t);
+  const b = Math.round(b1 + (b2 - b1) * t);
+  return `rgb(${r}, ${g}, ${b})`;
+}
 
 function toMatrixAttr(m: readonly [number, number, number, number, number, number]): string {
   return `matrix(${m[0].toFixed(5)} ${m[1].toFixed(5)} ${m[2].toFixed(5)} ${m[3].toFixed(5)} ${m[4].toFixed(2)} ${m[5].toFixed(2)})`;
@@ -69,7 +89,6 @@ export const DigitalMannequin: React.FC<DigitalMannequinProps> = React.memo(({
   darkMode,
   isPanning,
   isMotionActive = false,
-  compositeFilter,
   onPointerDownJoint,
   onPointerDownBone,
   onPointerDownHipToggle,
@@ -80,10 +99,10 @@ export const DigitalMannequin: React.FC<DigitalMannequinProps> = React.memo(({
 }) => {
   const [hoveredJointId, setHoveredJointId] = useState<JointId | null>(null);
   const selectedJoint = computedJoints[selectedJointId];
-  const blendMode = darkMode ? 'normal' : (compositeFilter?.blendMode ?? 'multiply');
-  const inkOpacity = compositeFilter?.inkOpacity ?? 0.94;
-  const edgeThreshold = compositeFilter?.edgeThreshold ?? 38;
-  const paperGrain = compositeFilter?.paperGrain ?? 0.35;
+  const blendMode = darkMode ? 'normal' : 'multiply';
+  const inkOpacity = 0.94;
+  const edgeThreshold = 38;
+  const paperGrain = 0.35;
   const bleedDispScale = Number((1.0 + paperGrain * 3.4).toFixed(2));
   const haloStdDev = Number((Math.max(0.4, 2.4 - (edgeThreshold / 100) * 1.8)).toFixed(2));
   const coreStdDev = Number((Math.max(0.15, 0.75 - (edgeThreshold / 100) * 0.55)).toFixed(2));
@@ -959,11 +978,17 @@ export const DigitalMannequin: React.FC<DigitalMannequinProps> = React.memo(({
 
           const collarSnapState = joint.collarSnapState;
           const collarResistanceRatio = joint.collarResistanceRatio;
-          const neckCollarPressureRatio = joint.neckCollarPressureRatio ?? 0;
+          const neckCollarPressureRatio =
+            handle.id === 'neck' ? (joint.neckCollarPressureRatio ?? 0) : 0;
+          const neckTensionMix =
+            neckCollarPressureRatio > 0
+              ? Math.min(1, Math.pow(neckCollarPressureRatio, 0.72))
+              : 0;
+          const strainRed = darkMode ? DARK_MODE_COOL_CRIMSON : REPO_STRAIN_CRIMSON;
           const isCollarResisting = collarSnapState === 'resisting';
           const isCollarSnapped = collarSnapState === 'snapped';
 
-          const ringStroke = isExplicitPin
+          const baseRingStroke = isExplicitPin
             ? '#D97706'
             : isCollarResisting
             ? '#D97706'
@@ -976,6 +1001,24 @@ export const DigitalMannequin: React.FC<DigitalMannequinProps> = React.memo(({
               ? DARK_MODE_HIGHLIGHT_PURPLE
               : '#0D9488'
             : greenGlow;
+
+          const ringStroke =
+            neckTensionMix > 0
+              ? blendHexColors(greenGlow, strainRed, neckTensionMix)
+              : baseRingStroke;
+
+          const jointDotFill =
+            neckTensionMix > 0
+              ? blendHexColors(greenJoint, strainRed, neckTensionMix)
+              : isExplicitPin
+              ? '#F59E0B'
+              : isCollarSnapped
+              ? darkMode
+                ? DARK_MODE_HIGHLIGHT_PURPLE
+                : '#0D9488'
+              : isCollarResisting
+              ? '#F59E0B'
+              : greenJoint;
 
           return (
             <g
@@ -1003,19 +1046,7 @@ export const DigitalMannequin: React.FC<DigitalMannequinProps> = React.memo(({
               }}
             >
               <circle r={6.5} fill="transparent" />
-              {handle.id === 'neck' && neckCollarPressureRatio > 0 && (
-                <circle
-                  r={5.5 + neckCollarPressureRatio * 2.5}
-                  fill="none"
-                  stroke={REPO_STRAIN_CRIMSON}
-                  strokeOpacity={0.25 + neckCollarPressureRatio * 0.65}
-                  strokeWidth={1 + neckCollarPressureRatio}
-                  style={{
-                    filter: `drop-shadow(0 0 ${1 + neckCollarPressureRatio * 3}px ${REPO_STRAIN_CRIMSON})`,
-                  }}
-                />
-              )}
-              {/* Subtle translucent verdigris halo on IK/selected/hovered/collar-snap joints */}
+              {/* Subtle translucent halo on IK/selected/hovered/collar-snap joints */}
               {(isSelected ||
                 isHovered ||
                 isIK ||
@@ -1055,21 +1086,13 @@ export const DigitalMannequin: React.FC<DigitalMannequinProps> = React.memo(({
               )}
               <circle
                 r={isSelected ? 2.4 : 2.05}
-                fill={
-                  handle.id === 'neck' && neckCollarPressureRatio > 0
-                    ? REPO_STRAIN_CRIMSON
-                    : isExplicitPin
-                    ? '#F59E0B'
-                    : isCollarSnapped
-                    ? darkMode
-                      ? DARK_MODE_HIGHLIGHT_PURPLE
-                      : '#0D9488'
-                    : isCollarResisting
-                    ? '#F59E0B'
-                    : greenJoint
-                }
+                fill={jointDotFill}
                 fillOpacity={
-                  isSelected || isHovered || isCollarResisting || isCollarSnapped ? 0.82 : 0.54
+                  neckTensionMix > 0
+                    ? 0.54 + neckTensionMix * 0.42
+                    : isSelected || isHovered || isCollarResisting || isCollarSnapped
+                    ? 0.82
+                    : 0.54
                 }
               />
             </g>
@@ -1079,7 +1102,23 @@ export const DigitalMannequin: React.FC<DigitalMannequinProps> = React.memo(({
         {(() => {
           const thorax = computedJoints.thorax;
           const neck = computedJoints.neck;
-          const pressure = neck.neckCollarPressureRatio ?? 0;
+          const sep = armature.neckCollarSeparation ?? { x: 0, y: 0 };
+          const sepDist = Math.hypot(sep.x, sep.y);
+          const maxSepPx = Math.max(
+            1e-4,
+            (neck.spec.restTip
+              ? Math.hypot(
+                  neck.spec.restTip[0] - neck.spec.restPivot[0],
+                  neck.spec.restTip[1] - neck.spec.restPivot[1]
+                )
+              : neck.effectiveLengthPx) *
+              0.5 *
+              PUPPYT_TO_EVOLVED_SCALE
+          );
+          const pressure =
+            sepDist > 1e-3 ? Math.max(0, Math.min(1, sepDist / maxSepPx)) : 0;
+          const tensionMix = pressure > 0 ? Math.min(1, Math.pow(pressure, 0.72)) : 0;
+          const strainRed = darkMode ? DARK_MODE_COOL_CRIMSON : REPO_STRAIN_CRIMSON;
           const x = (thorax.x + neck.x) / 2;
           const y = (thorax.y + neck.y) / 2;
           return (
@@ -1096,29 +1135,18 @@ export const DigitalMannequin: React.FC<DigitalMannequinProps> = React.memo(({
             >
               <title>Drag to separate the neck and collar group; double-click to reconnect</title>
               <circle r={8} fill="transparent" />
-              {pressure > 0.01 && (
-                <circle
-                  r={5.6 + pressure * 2.2}
-                  fill="none"
-                  stroke={REPO_STRAIN_CRIMSON}
-                  strokeOpacity={0.28 + pressure * 0.62}
-                  strokeWidth={1 + pressure}
-                  style={{
-                    filter: `drop-shadow(0 0 ${1 + pressure * 3}px ${REPO_STRAIN_CRIMSON})`,
-                  }}
-                />
-              )}
               <circle
                 r={3.5}
                 fill="none"
-                stroke={pressure > 0.01 ? REPO_STRAIN_CRIMSON : greenGlow}
-                strokeOpacity={pressure > 0.01 ? 0.92 : 0.38}
+                stroke={blendHexColors(greenGlow, strainRed, tensionMix)}
+                strokeOpacity={tensionMix > 0 ? 0.52 + tensionMix * 0.42 : 0.38}
                 strokeWidth={1.15}
               />
               <path
                 d="M-1.6,-1.7 V1.7 M1.6,-1.7 V1.7"
                 fill="none"
-                stroke={pressure > 0.01 ? REPO_STRAIN_CRIMSON : greenJoint}
+                stroke={blendHexColors(greenJoint, strainRed, tensionMix)}
+                strokeOpacity={tensionMix > 0 ? 0.75 + tensionMix * 0.25 : 1}
                 strokeWidth={1.15}
                 strokeLinecap="round"
               />

@@ -11,8 +11,6 @@ export interface GridConfig {
   showVitruvianGuide: boolean;
   showWorkingSquare: boolean;
   showEightHeadGuide: boolean;
-  showRulers: boolean;
-  inkStrength: 'whisper' | 'light' | 'draft';
 }
 
 export interface PageMeta {

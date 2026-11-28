@@ -23,7 +23,6 @@ import {
   JointMode,
   JointRuntimeState,
   JointSpec,
-  MotionCurve,
   PhysicsModeId,
   Point2D,
   PosePresetId,
@@ -1774,6 +1773,253 @@ export function solveFABRIKChainIK(
   return current;
 }
 
+export function solveArmTipIK(
+  state: ArmatureState,
+  tipId: 'fingerTipR' | 'fingerTipL' | 'fingerR' | 'fingerL',
+  targetX: number,
+  targetY: number,
+  canvasOrigin: Point2D = { x: PAPER_WIDTH / 2, y: PAPER_HEIGHT / 2 },
+  options?: {
+    solver?: 'analytical' | 'fabrik' | 'ccd';
+    softDamp?: boolean;
+    constrainLimits?: boolean;
+  }
+): ArmatureState {
+  const isRight = tipId === 'fingerTipR' || tipId === 'fingerR';
+  const humerusId: JointId = isRight ? 'humerusR' : 'humerusL';
+  const forearmId: JointId = isRight ? 'forearmR' : 'forearmL';
+  const handId: JointId = isRight ? 'handR' : 'handL';
+  const fingerId: JointId = isRight ? 'fingerR' : 'fingerL';
+  const fingerTipId: JointId = isRight ? 'fingerTipR' : 'fingerTipL';
+
+  let current: ArmatureState = {
+    ...state,
+    joints: { ...state.joints },
+  };
+
+  const initialComp = computeArmature(current, canvasOrigin);
+  const hand0 = initialComp[handId];
+  const tip0 = initialComp[fingerTipId];
+  const handSpanPx = Math.max(1, Math.hypot(tip0.x - hand0.x, tip0.y - hand0.y));
+
+  for (let pass = 0; pass < 3; pass++) {
+    const comp = computeArmature(current, canvasOrigin);
+    const wrist = comp[handId];
+    const shoulder = comp[humerusId];
+
+    let dx = targetX - wrist.x;
+    let dy = targetY - wrist.y;
+    let dist = Math.hypot(dx, dy);
+    if (dist < 1e-3) {
+      dx = targetX - shoulder.x;
+      dy = targetY - shoulder.y;
+      dist = Math.hypot(dx, dy);
+    }
+    const dirX = dist > 1e-4 ? dx / dist : isRight ? -1 : 1;
+    const dirY = dist > 1e-4 ? dy / dist : 0;
+
+    const wristTargetX = targetX - dirX * handSpanPx;
+    const wristTargetY = targetY - dirY * handSpanPx;
+
+    if (
+      options?.solver === 'fabrik' &&
+      Array.isArray(JOINT_SPEC_MAP[handId].ikChain)
+    ) {
+      current = solveFABRIKChainIK(
+        current,
+        [...(JOINT_SPEC_MAP[handId].ikChain as readonly JointId[])],
+        wristTargetX,
+        wristTargetY,
+        canvasOrigin,
+        options
+      );
+    } else {
+      current = solveTwoBoneIK(
+        current,
+        handId,
+        wristTargetX,
+        wristTargetY,
+        canvasOrigin,
+        options
+      );
+    }
+
+    const afterArmComp = computeArmature(current, canvasOrigin);
+    const wristAfter = afterArmComp[handId];
+    const tipAfter = afterArmComp[fingerTipId];
+    const curTipVecX = tipAfter.x - wristAfter.x;
+    const curTipVecY = tipAfter.y - wristAfter.y;
+    const targetVecX = targetX - wristAfter.x;
+    const targetVecY = targetY - wristAfter.y;
+
+    if (Math.hypot(curTipVecX, curTipVecY) > 1e-3 && Math.hypot(targetVecX, targetVecY) > 1e-3) {
+      const curDeg = Math.atan2(curTipVecY, curTipVecX) * RAD_TO_DEG;
+      const desiredDeg = Math.atan2(targetVecY, targetVecX) * RAD_TO_DEG;
+      const deltaDeg = shortestAngleDelta(curDeg, desiredDeg);
+
+      const handRt = current.joints[handId];
+      if (handRt && handRt.mode !== 'PIN' && handRt.physicsMode !== 'rigid') {
+        const multHand = getPhysicsMultiplier(handRt);
+        let nextHandLocal = applyJointAngleConstraint(
+          handRt.localAngle + deltaDeg * multHand,
+          current.continuousSpin
+        );
+        if (options?.constrainLimits && JOINT_SPEC_MAP[handId]?.limits) {
+          const lim = JOINT_SPEC_MAP[handId].limits!;
+          nextHandLocal = Math.max(lim[0], Math.min(lim[1], nextHandLocal));
+        }
+        current = {
+          ...current,
+          joints: {
+            ...current.joints,
+            [handId]: { ...handRt, localAngle: nextHandLocal },
+          },
+        };
+      }
+
+      // Apply any remaining fingertip precision angle onto finger joint (e.g. if wrist hits limit)
+      const afterHandComp = computeArmature(current, canvasOrigin);
+      const wristAfterHand = afterHandComp[handId];
+      const tipAfterHand = afterHandComp[fingerTipId];
+      const remCurDeg =
+        Math.atan2(tipAfterHand.y - wristAfterHand.y, tipAfterHand.x - wristAfterHand.x) *
+        RAD_TO_DEG;
+      const remDesiredDeg =
+        Math.atan2(targetY - wristAfterHand.y, targetX - wristAfterHand.x) * RAD_TO_DEG;
+      const remDelta = shortestAngleDelta(remCurDeg, remDesiredDeg);
+      const fingerRt = current.joints[fingerId];
+      if (
+        Math.abs(remDelta) > 0.1 &&
+        fingerRt &&
+        fingerRt.mode !== 'PIN' &&
+        fingerRt.physicsMode !== 'rigid'
+      ) {
+        const multFinger = getPhysicsMultiplier(fingerRt);
+        let nextFingerLocal = applyJointAngleConstraint(
+          fingerRt.localAngle + remDelta * multFinger,
+          current.continuousSpin
+        );
+        if (options?.constrainLimits && JOINT_SPEC_MAP[fingerId]?.limits) {
+          const lim = JOINT_SPEC_MAP[fingerId].limits!;
+          nextFingerLocal = Math.max(lim[0], Math.min(lim[1], nextFingerLocal));
+        }
+        current = {
+          ...current,
+          joints: {
+            ...current.joints,
+            [fingerId]: { ...fingerRt, localAngle: nextFingerLocal },
+          },
+        };
+      }
+    }
+
+    // Keep humerus/forearm mode active when inspected
+    void forearmId;
+  }
+
+  return current;
+}
+
+export function solvePlanquetteArmReach(
+  startState: ArmatureState,
+  effectorId: 'handR' | 'handL' | 'fingerTipR' | 'fingerTipL',
+  targetX: number,
+  targetY: number,
+  canvasOrigin: Point2D = { x: PAPER_WIDTH / 2, y: PAPER_HEIGHT / 2 },
+  options?: {
+    solver?: 'analytical' | 'fabrik' | 'ccd';
+    softDamp?: boolean;
+    constrainLimits?: boolean;
+  }
+): ArmatureState {
+  const isRight = effectorId.endsWith('R');
+  const shoulderId: JointId = isRight ? 'humerusR' : 'humerusL';
+  const startComp = computeArmature(startState, canvasOrigin);
+  const startShoulder = startComp[shoulderId];
+  const startEff = startComp[effectorId];
+  const armReach = Math.max(
+    180,
+    Math.hypot(startEff.x - startShoulder.x, startEff.y - startShoulder.y)
+  );
+  const dx = targetX - startShoulder.x;
+  const distFromStartShoulder = Math.hypot(dx, targetY - startShoulder.y);
+
+  const direct = solveJointIK(startState, effectorId, targetX, targetY, canvasOrigin, {
+    ...options,
+    softDamp: distFromStartShoulder < armReach * 0.88 ? options?.softDamp : false,
+  });
+  const directComp = computeArmature(direct, canvasOrigin);
+  const directEff = directComp[effectorId];
+  const directErr = Math.hypot(targetX - directEff.x, targetY - directEff.y);
+  if (directErr <= 2 && distFromStartShoulder <= armReach * 0.92) {
+    return direct;
+  }
+
+  // Recruit upper spine lean + grounded waist sway smoothly toward the target so both wrists and fingertips reach every arc letter
+  const excess = Math.max(0, distFromStartShoulder - armReach * 0.88);
+  const leanRatio = Math.min(1, excess / 150);
+  const leanSign = Math.abs(dx) < 1e-3 ? 0 : Math.sign(dx);
+  const leanDeg = leanSign * Math.min(44, 44 * leanRatio);
+
+  let leaned: ArmatureState = {
+    ...startState,
+    joints: { ...startState.joints },
+  };
+
+  if (leanRatio > 0 && leanSign !== 0) {
+    const lumbarRt = leaned.joints.lumbar;
+    const thoraxRt = leaned.joints.thorax;
+    if (lumbarRt && lumbarRt.mode !== 'PIN' && lumbarRt.physicsMode !== 'rigid') {
+      leaned.joints.lumbar = {
+        ...lumbarRt,
+        localAngle: Math.max(-45, Math.min(45, lumbarRt.localAngle + leanDeg * 0.55)),
+      };
+    }
+    if (thoraxRt && thoraxRt.mode !== 'PIN' && thoraxRt.physicsMode !== 'rigid') {
+      leaned.joints.thorax = {
+        ...thoraxRt,
+        localAngle: Math.max(-45, Math.min(45, thoraxRt.localAngle + leanDeg * 0.45)),
+      };
+    }
+  }
+
+  const afterLeanComp = computeArmature(leaned, canvasOrigin);
+  const leanShoulder = afterLeanComp[shoulderId];
+  const remDx = targetX - leanShoulder.x;
+  const remainingDist = Math.hypot(remDx, targetY - leanShoulder.y);
+
+  if (remainingDist > armReach * 0.9) {
+    const pelvis = afterLeanComp.pelvis;
+    const swayRatio = Math.min(1, (remainingDist - armReach * 0.9) / 110);
+    const clampedShiftX = Math.max(-220, Math.min(220, remDx * 0.9 * swayRatio));
+    const shiftY = Math.min(24, Math.abs(clampedShiftX) * 0.1);
+
+    const groundY = canvasOrigin.y + computeProportionalCanons().eightHeadTotalPx / 2;
+    leaned = solveWaistBalanceHula(
+      leaned,
+      pelvis.x + clampedShiftX,
+      pelvis.y + shiftY,
+      getGroundContactPin(afterLeanComp.footR, afterLeanComp.toeR, groundY, 'R'),
+      getGroundContactPin(afterLeanComp.footL, afterLeanComp.toeL, groundY, 'L'),
+      canvasOrigin,
+      {
+        baseRootRotation: leaned.rootRotation,
+        baseLumbarAngle: leaned.joints.lumbar.localAngle,
+        baseThoraxAngle: leaned.joints.thorax.localAngle,
+        baseNeckAngle: leaned.joints.neck.localAngle,
+        startPelvisX: pelvis.x,
+        startPelvisY: pelvis.y,
+        torsoCompensation: 0,
+      }
+    );
+  }
+
+  return solveJointIK(leaned, effectorId, targetX, targetY, canvasOrigin, {
+    ...options,
+    softDamp: false,
+  });
+}
+
 export function solveJointIK(
   state: ArmatureState,
   jointId: JointId,
@@ -1791,6 +2037,16 @@ export function solveJointIK(
 
   if (jointId === 'pelvis') {
     return solveBoneAimRotation(state, 'pelvis', targetX, targetY, canvasOrigin);
+  }
+
+  // Whole-arm fingertip IK: dragging finger or fingerTip guides humerus + forearm + hand + finger
+  if (
+    jointId === 'fingerTipR' ||
+    jointId === 'fingerTipL' ||
+    jointId === 'fingerR' ||
+    jointId === 'fingerL'
+  ) {
+    return solveArmTipIK(state, jointId, targetX, targetY, canvasOrigin, options);
   }
 
   // Aim IK for joints configured as single-bone direct tracking
@@ -2577,32 +2833,26 @@ export function solveTorsoBalance(
   return next;
 }
 
-export function evaluateMotionCurve(t: number, curve: MotionCurve = 'flow'): number {
-  const clamped = Math.max(0, Math.min(1, t));
-  switch (curve) {
-    case 'flow':
-      return clamped < 0.5
-        ? 4 * clamped * clamped * clamped
-        : 1 - Math.pow(-2 * clamped + 2, 3) / 2;
-    case 'snap':
-      return 1 - Math.pow(1 - clamped, 4);
-    case 'elastic':
-      if (clamped === 0 || clamped === 1) return clamped;
-      return Math.sin((clamped * 10 - 0.75) * ((2 * Math.PI) / 3)) * Math.pow(2, -10 * clamped) + 1;
-    case 'mechanical':
-      return clamped;
-    case 'clockwork': {
-      const steps = 14;
-      return Math.floor(clamped * steps) / steps;
-    }
-    case 'procedural':
-    default:
-      return (1 - Math.cos(clamped * Math.PI)) / 2;
+export type TransitionEasing = 'smooth' | 'linear' | 'elastic';
+
+export function evaluateTransitionEasing(t: number, easing: TransitionEasing = 'smooth'): number {
+  if (t <= 0) return 0;
+  if (t >= 1) return 1;
+  const clamped = t;
+  if (easing === 'linear') return clamped;
+  if (easing === 'elastic') {
+    // Elasti-hose physics: spring and rubber-band damped snap back
+    const p = 0.38;
+    return Math.pow(2, -8 * clamped) * Math.sin(((clamped - p / 4) * (2 * Math.PI)) / p) + 1;
   }
+  return clamped < 0.5
+    ? 4 * clamped * clamped * clamped
+    : 1 - Math.pow(-2 * clamped + 2, 3) / 2;
 }
 
 export const DEFAULT_POSE_TRANSITION_MS = 320;
 export const DEFAULT_TOGGLE_TRANSITION_MS = 220;
+export const ELASTI_HOSE_TRANSITION_MS = 420;
 
 export function hasArmaturePoseDelta(a: ArmatureState, b: ArmatureState, eps = 1e-3): boolean {
   if (
@@ -2642,13 +2892,13 @@ export function interpolateArmatures(
   a: ArmatureState,
   b: ArmatureState,
   t: number,
-  curve: MotionCurve = 'flow'
+  easing: TransitionEasing = 'smooth'
 ): ArmatureState {
   const clampedT = Math.max(0, Math.min(1, t));
   if (clampedT <= 0) return a;
   if (clampedT >= 1) return b;
 
-  const easedT = evaluateMotionCurve(clampedT, curve);
+  const easedT = evaluateTransitionEasing(clampedT, easing);
   const nextJoints = { ...a.joints };
 
   for (const key of Object.keys(a.joints) as JointId[]) {
@@ -2720,27 +2970,16 @@ export function computePoseTransitionFrame(
   to: ArmatureState,
   elapsedMs: number,
   durationMs: number = DEFAULT_POSE_TRANSITION_MS,
-  curve: MotionCurve = 'flow'
+  easing: TransitionEasing = 'smooth'
 ): { armature: ArmatureState; progress: number; done: boolean } {
   const safeDuration = Math.max(0, durationMs);
   const progress =
     safeDuration <= 0 ? 1 : Math.max(0, Math.min(1, elapsedMs / safeDuration));
   return {
-    armature: interpolateArmatures(from, to, progress, curve),
+    armature: interpolateArmatures(from, to, progress, easing),
     progress,
     done: progress >= 1,
   };
-}
-
-export function synthesizeProceduralBreakdown(
-  poseA: ArmatureState,
-  poseC: ArmatureState
-): ArmatureState {
-  const mid = interpolateArmatures(poseA, poseC, 0.5, 'procedural');
-  mid.rootY += 3.5;
-  if (mid.joints.lumbar) mid.joints.lumbar.localAngle += 2.5;
-  if (mid.joints.thorax) mid.joints.thorax.localAngle -= 1.5;
-  return mid;
 }
 
 export function solveBoneAimRotation(

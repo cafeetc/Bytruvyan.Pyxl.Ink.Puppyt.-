@@ -13,7 +13,7 @@ export const REPO_GREEN_JOINT_DARK = '#58C76E';
 export const REPO_GREEN_GLOW_LIGHT = '#6D7A71';
 export const REPO_GREEN_GLOW_DARK = '#8C9990';
 export const REPO_SECONDARY_PURPLE = '#261D2E';
-export const REPO_STRAIN_CRIMSON = '#F04438';
+export const REPO_STRAIN_CRIMSON = '#E11D48';
 
 export const FACEPLATE_SLIDE_LIMIT_SVG = 30;
 export const TORSO_HANDLE_CENTER_SVG = [824, 810] as const;
@@ -508,7 +508,7 @@ const RAW_43_JOINT_SPECS: JointSpec[] = [
     endExtensionPx: vecLenScaled(PUPPYT_LANDMARKS.thumbR, PUPPYT_LANDMARKS.thumbTipR),
     bodyPartCategory: 'digits',
     limits: [-75, 75],
-    defaultLocalAngle: 0,
+    defaultLocalAngle: -22.5,
     defaultMode: 'FK',
     ikChain: ['handR', 'thumbR'],
     ikSolverType: 'aim',
@@ -546,7 +546,7 @@ const RAW_43_JOINT_SPECS: JointSpec[] = [
     bodyPartCategory: 'digits',
     limits: [-45, 95],
     defaultLocalAngle: 0,
-    defaultMode: 'FK',
+    defaultMode: 'IK',
     ikChain: ['handR', 'fingerR'],
     ikSolverType: 'aim',
   },
@@ -565,6 +565,8 @@ const RAW_43_JOINT_SPECS: JointSpec[] = [
     locked: true,
     defaultLocalAngle: 0,
     defaultMode: 'PIN',
+    ikChain: ['handR', 'fingerR', 'fingerTipR'],
+    bendDirection: -1,
   },
 
   // Left Shoulder Girdle & Arm & Digits (12) — alternative swivel + split collarbone
@@ -721,7 +723,7 @@ const RAW_43_JOINT_SPECS: JointSpec[] = [
     endExtensionPx: vecLenScaled(PUPPYT_LANDMARKS.thumbL, PUPPYT_LANDMARKS.thumbTipL),
     bodyPartCategory: 'digits',
     limits: [-75, 75],
-    defaultLocalAngle: 0,
+    defaultLocalAngle: 22.5,
     defaultMode: 'FK',
     ikChain: ['handL', 'thumbL'],
     ikSolverType: 'aim',
@@ -759,7 +761,7 @@ const RAW_43_JOINT_SPECS: JointSpec[] = [
     bodyPartCategory: 'digits',
     limits: [-95, 45],
     defaultLocalAngle: 0,
-    defaultMode: 'FK',
+    defaultMode: 'IK',
     ikChain: ['handL', 'fingerL'],
     ikSolverType: 'aim',
   },
